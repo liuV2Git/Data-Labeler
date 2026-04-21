@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from data_labeler.models import ScanResult
@@ -11,6 +12,7 @@ SUPPORTED_DOCUMENT_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
 SCHEMA_FILE_PREFIX = "schema"
 CATEGORIES_FILE_NAME = "categories.json"
 LABELS_FILE_NAME = "labels.json"
+VERSION_PATTERN = re.compile(r"\.v(\d+)\.json$", re.IGNORECASE)
 
 
 def _find_support_root(root_path: Path) -> Path:
@@ -106,8 +108,39 @@ def scan_folder(root_path: Path) -> ScanResult:
         if normalized_name == LABELS_FILE_NAME and result.labels_file is None:
             result.labels_file = path
 
-    result.schema_files.sort()
+    result.schema_files.sort(key=_schema_sort_key)
     return result
+
+
+def _schema_sort_key(path: Path) -> tuple[int, str]:
+    """Builds a stable sort key for schema files.
+
+    Args:
+        path: Schema file path.
+
+    Returns:
+        A tuple that sorts versioned schemas numerically and then by name.
+    """
+
+    match = VERSION_PATTERN.search(path.name)
+    version = int(match.group(1)) if match else -1
+    return (version, path.name.lower())
+
+
+def get_default_active_schema(schema_files: list[Path]) -> Path | None:
+    """Returns the default active schema for a folder.
+
+    Args:
+        schema_files: Available schema files.
+
+    Returns:
+        The latest schema file, or ``None`` when none are available.
+    """
+
+    if not schema_files:
+        return None
+
+    return max(schema_files, key=_schema_sort_key)
 
 
 def format_relative_paths(paths: list[Path], root_path: Path) -> list[str]:
