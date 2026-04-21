@@ -39,9 +39,7 @@ def _find_support_root(root_path: Path) -> Path:
             name.startswith(SCHEMA_FILE_PREFIX) and name.endswith(".json")
             for name in child_names
         )
-        has_shared_files = (
-            CATEGORIES_FILE_NAME in child_names or LABELS_FILE_NAME in child_names
-        )
+        has_shared_files = CATEGORIES_FILE_NAME in child_names
 
         if has_schema or has_shared_files:
             return candidate
@@ -105,8 +103,9 @@ def scan_folder(root_path: Path) -> ScanResult:
             result.categories_file = path
             continue
 
-        if normalized_name == LABELS_FILE_NAME and result.labels_file is None:
-            result.labels_file = path
+    labels_path = root_path / LABELS_FILE_NAME
+    if labels_path.is_file():
+        result.labels_file = labels_path
 
     result.schema_files.sort(key=_schema_sort_key)
     return result

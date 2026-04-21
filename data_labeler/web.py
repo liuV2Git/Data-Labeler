@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 from urllib.parse import urlparse
 
@@ -34,6 +35,7 @@ class AppState:
         active_schema: Schema currently selected by the user.
         active_document: Document currently selected in the review workspace.
         review_data: In-memory review values keyed by absolute document path.
+        reviewed_documents: Absolute document paths that have been saved.
         status_message: Short UI status text.
     """
 
@@ -42,6 +44,7 @@ class AppState:
     active_schema: Path | None = None
     active_document: Path | None = None
     review_data: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
+    reviewed_documents: set[str] = field(default_factory=set)
     status_message: str = (
         "Choose a folder to discover documents, select a schema, and begin review."
     )
@@ -82,7 +85,7 @@ def _serialize_scan_result(result: ScanResult | None) -> dict[str, Any]:
             else None
         ),
         "labelsFile": (
-            str(result.labels_file.relative_to(support_root))
+            str(result.labels_file.relative_to(result.root_path))
             if result.labels_file
             else None
         ),
@@ -262,7 +265,7 @@ def _ensure_review_record(state: AppState, document_path: Path | None) -> None:
 
     record = state.review_data.setdefault(
         str(document_path),
-        {"fields": {}, "categories": {}},
+        {"fields": {}, "categories": {}, "meta": {}},
     )
 
     for field in schema_fields:
@@ -317,6 +320,10 @@ def _build_review_payload(state: AppState) -> dict[str, Any]:
         "reviewCategories": categories_payload,
         "reviewSchemaError": schema_error,
         "reviewCategoriesError": categories_error,
+        "reviewedDocuments": [
+            _relative_path(Path(document_key), state.scan_result.root_path)
+            for document_key in sorted(state.reviewed_documents)
+        ] if state.scan_result else [],
     }
 
 
@@ -384,6 +391,7 @@ def _scan_selected_folder(state: AppState, folder: Path) -> None:
         state.active_schema = get_default_active_schema(state.scan_result.schema_files)
 
     _ensure_active_document(state)
+    _load_saved_reviews(state)
     _ensure_review_record(state, state.active_document)
 
     document_count = state.scan_result.document_count
@@ -395,6 +403,180 @@ def _scan_selected_folder(state: AppState, folder: Path) -> None:
         state.status_message = (
             f"Scan complete. Found {document_count} supported documents."
         )
+
+
+def _labels_path_for_state(state: AppState) -> Path:
+    """Returns the labels.json path for the current scan context.
+
+    Args:
+        state: Shared application state.
+
+    Returns:
+        Path to the output labels file.
+
+    Raises:
+        RuntimeError: If no folder has been scanned yet.
+    """
+
+    if state.scan_result is None:
+        raise RuntimeError("Choose a folder before saving reviews.")
+
+    if state.scan_result.labels_file is not None:
+        return state.scan_result.labels_file
+
+    labels_path = state.scan_result.root_path / "labels.json"
+    state.scan_result.labels_file = labels_path
+    return labels_path
+
+
+def _load_saved_reviews(state: AppState) -> None:
+    """Loads saved reviews from labels.json into in-memory state.
+
+    Args:
+        state: Shared application state.
+    """
+
+    state.reviewed_documents.clear()
+
+    if state.scan_result is None or state.scan_result.labels_file is None:
+        return
+
+    labels_json, error = _read_json_file(state.scan_result.labels_file)
+    if labels_json is None:
+        if error:
+            state.scan_result.warnings.append(
+                f"Could not read {state.scan_result.labels_file.name}: {error}"
+            )
+        return
+
+    records = labels_json.get("documents", labels_json)
+    if not isinstance(records, list):
+        state.scan_result.warnings.append("labels.json has an unexpected format.")
+        return
+
+    current_documents = {
+        str(document.resolve()): document for document in state.scan_result.documents
+    }
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+
+        document_id = record.get("document_id")
+        file_path = record.get("file_path")
+        resolved_path: Path | None = None
+
+        if isinstance(document_id, str) and document_id in current_documents:
+            resolved_path = current_documents[document_id]
+        elif isinstance(file_path, str):
+            candidate = state.scan_result.root_path / file_path
+            candidate_resolved = candidate.resolve()
+            resolved_path = current_documents.get(str(candidate_resolved))
+
+        if resolved_path is None:
+            continue
+
+        document_key = str(resolved_path)
+        review_record = state.review_data.setdefault(
+            document_key,
+            {"fields": {}, "categories": {}, "meta": {}},
+        )
+        review_record["fields"].update(record.get("fields", {}))
+        review_record["categories"].update(record.get("categories", {}))
+        review_record["meta"].update(
+            {
+                "schema_file": record.get("schema_file"),
+                "schema_path": record.get("schema_path"),
+            }
+        )
+        state.reviewed_documents.add(document_key)
+
+
+def _build_labels_records(state: AppState) -> list[dict[str, Any]]:
+    """Builds labels.json records from the in-memory review state.
+
+    Args:
+        state: Shared application state.
+
+    Returns:
+        List of review records that should be written to labels.json.
+    """
+
+    if state.scan_result is None:
+        return []
+
+    support_root = state.scan_result.support_root or state.scan_result.root_path
+    records: list[dict[str, Any]] = []
+
+    for document_path in state.scan_result.documents:
+        document_key = str(document_path)
+        if document_key not in state.reviewed_documents:
+            continue
+
+        review_record = state.review_data.get(
+            document_key, {"fields": {}, "categories": {}, "meta": {}}
+        )
+        records.append(
+            {
+                "document_id": str(document_path.resolve()),
+                "file_name": document_path.name,
+                "file_path": _relative_path(document_path, state.scan_result.root_path),
+                "schema_file": review_record.get("meta", {}).get("schema_file"),
+                "schema_path": review_record.get("meta", {}).get("schema_path"),
+                "status": "reviewed",
+                "fields": review_record.get("fields", {}),
+                "categories": review_record.get("categories", {}),
+            }
+        )
+
+    return records
+
+
+def _save_active_review(state: AppState) -> None:
+    """Persists the active document review into labels.json.
+
+    Args:
+        state: Shared application state.
+
+    Raises:
+        RuntimeError: If no document is selected.
+    """
+
+    if state.active_document is None:
+        raise RuntimeError("Select a document before saving.")
+
+    _ensure_review_record(state, state.active_document)
+    active_record = state.review_data[str(state.active_document)]
+    active_record.setdefault("meta", {})
+    active_record["meta"]["schema_file"] = (
+        state.active_schema.name if state.active_schema else None
+    )
+    active_record["meta"]["schema_path"] = (
+        _relative_path(
+            state.active_schema,
+            state.scan_result.support_root or state.scan_result.root_path,
+        )
+        if state.scan_result and state.active_schema
+        else None
+    )
+
+    labels_path = _labels_path_for_state(state)
+    state.reviewed_documents.add(str(state.active_document))
+    payload = {"documents": _build_labels_records(state)}
+
+    labels_path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=str(labels_path.parent),
+        delete=False,
+    ) as temporary_file:
+        json.dump(payload, temporary_file, indent=2, ensure_ascii=True)
+        temporary_file.write("\n")
+        temp_path = Path(temporary_file.name)
+
+    temp_path.replace(labels_path)
+    state.status_message = f"Saved review for {state.active_document.name}."
 
 
 def _set_active_schema(state: AppState, schema_name: str) -> None:
@@ -604,6 +786,11 @@ class DataLabelerHandler(BaseHTTPRequestHandler):
                     body.get("categoryName", ""),
                     body.get("value"),
                 )
+                self._send_json({"ok": True, **_serialize_state(self.app_state)})
+                return
+
+            if parsed.path == "/api/save-review":
+                _save_active_review(self.app_state)
                 self._send_json({"ok": True, **_serialize_state(self.app_state)})
                 return
 
@@ -825,6 +1012,7 @@ def _build_html() -> str:
       .badge.teal { background: var(--teal-soft); color: var(--teal); }
       .badge.blue { background: var(--blue-soft); color: var(--blue); }
       .badge.amber { background: var(--amber-soft); color: var(--amber); }
+      .badge.reviewed { background: var(--teal-soft); color: var(--teal); }
       .list-shell {
         border: 1px solid var(--border);
         border-radius: 16px;
@@ -1070,8 +1258,8 @@ def _build_html() -> str:
             </div>
 
             <div class="placeholder-actions">
-              <button class="secondary" disabled>Save Draft (Story 4)</button>
-              <button disabled>Save Review (Story 4)</button>
+              <button class="secondary" disabled>Save Draft</button>
+              <button id="save-review">Save Review</button>
             </div>
           </div>
         </div>
@@ -1104,6 +1292,7 @@ def _build_html() -> str:
       const categoriesErrorEl = document.querySelector("#categories-error");
       const fieldsErrorEl = document.querySelector("#fields-error");
       const openActiveDocumentButton = document.querySelector("#open-active-document");
+      const saveReviewButton = document.querySelector("#save-review");
 
       const chooseFolderButton = document.querySelector("#choose-folder");
       const refreshFolderButton = document.querySelector("#refresh-folder");
@@ -1216,7 +1405,16 @@ def _build_html() -> str:
             badge.className = "badge blue";
             badge.textContent = "Selected";
             controls.appendChild(badge);
-          } else {
+          }
+
+          if (payload.reviewedDocuments.includes(documentPath)) {
+            const reviewedBadge = document.createElement("span");
+            reviewedBadge.className = "badge reviewed";
+            reviewedBadge.textContent = "Reviewed";
+            controls.appendChild(reviewedBadge);
+          }
+
+          if (payload.activeDocument !== documentPath) {
             const button = document.createElement("button");
             button.className = "secondary";
             button.textContent = "Select";
@@ -1384,6 +1582,7 @@ def _build_html() -> str:
         refreshSchemasButton.disabled = !payload.selectedFolder;
         openActiveSchemaButton.disabled = !payload.activeSchema;
         openActiveDocumentButton.disabled = !payload.activeDocument;
+        saveReviewButton.disabled = !payload.activeDocument;
         navReviewButton.disabled = !payload.selectedFolder;
         activeSchemaNameEl.textContent = payload.activeSchema || "No active schema selected";
         schemaPreviewEl.textContent = payload.schemaPreviewError
@@ -1429,6 +1628,12 @@ def _build_html() -> str:
       openActiveSchemaButton.addEventListener("click", async () => {
         statusEl.textContent = "Opening active schema...";
         const payload = await requestJson("/api/open-active-schema", { method: "POST" });
+        renderState(payload);
+      });
+
+      saveReviewButton.addEventListener("click", async () => {
+        statusEl.textContent = "Saving review...";
+        const payload = await requestJson("/api/save-review", { method: "POST" });
         renderState(payload);
       });
 
