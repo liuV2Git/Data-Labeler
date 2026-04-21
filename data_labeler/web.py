@@ -1,4 +1,4 @@
-"""Local web application for Story 2 schema selection and preview."""
+"""Local web application for Story 3 review workflow."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 import subprocess
 import threading
 import webbrowser
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,14 +32,18 @@ class AppState:
         selected_folder: Folder currently selected by the user.
         scan_result: Most recent scan result.
         active_schema: Schema currently selected by the user.
+        active_document: Document currently selected in the review workspace.
+        review_data: In-memory review values keyed by absolute document path.
         status_message: Short UI status text.
     """
 
     selected_folder: Path | None = None
     scan_result: ScanResult | None = None
     active_schema: Path | None = None
+    active_document: Path | None = None
+    review_data: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
     status_message: str = (
-        "Choose a folder to discover documents and support files."
+        "Choose a folder to discover documents, select a schema, and begin review."
     )
 
 
@@ -88,6 +92,85 @@ def _serialize_scan_result(result: ScanResult | None) -> dict[str, Any]:
     }
 
 
+def _read_json_file(file_path: Path | None) -> tuple[dict[str, Any] | None, str | None]:
+    """Reads a JSON file and reports parse errors without raising.
+
+    Args:
+        file_path: File that should be read.
+
+    Returns:
+        A tuple of parsed JSON content and an optional error string.
+    """
+
+    if file_path is None:
+        return None, None
+
+    try:
+        contents = file_path.read_text(encoding="utf-8")
+        return json.loads(contents), None
+    except Exception as error:  # noqa: BLE001
+        return None, str(error)
+
+
+def _load_schema_definition(schema_path: Path | None) -> tuple[list[dict[str, Any]], str | None]:
+    """Loads normalized schema fields from the active schema file.
+
+    Args:
+        schema_path: Active schema path.
+
+    Returns:
+        A tuple of normalized field definitions and an optional error string.
+    """
+
+    schema_json, error = _read_json_file(schema_path)
+    if schema_json is None:
+        return [], error
+
+    raw_fields = schema_json.get("fields", [])
+    normalized_fields: list[dict[str, Any]] = []
+    for field in raw_fields:
+        normalized_fields.append(
+            {
+                "name": field.get("name", ""),
+                "label": field.get("label") or field.get("name", ""),
+                "type": field.get("type", "string"),
+                "description": field.get("description", ""),
+            }
+        )
+    return normalized_fields, None
+
+
+def _load_categories_definition(
+    categories_path: Path | None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Loads normalized category definitions from the categories config.
+
+    Args:
+        categories_path: Categories config path.
+
+    Returns:
+        A tuple of normalized category definitions and an optional error string.
+    """
+
+    categories_json, error = _read_json_file(categories_path)
+    if categories_json is None:
+        return [], error
+
+    raw_categories = categories_json.get("categories", [])
+    normalized_categories: list[dict[str, Any]] = []
+    for category in raw_categories:
+        options = category.get("options", [])
+        normalized_categories.append(
+            {
+                "name": category.get("name", ""),
+                "description": category.get("description", ""),
+                "options": options,
+                "kind": "select" if options else "boolean",
+            }
+        )
+    return normalized_categories, None
+
+
 def _read_schema_preview(schema_path: Path | None) -> dict[str, Any]:
     """Reads the active schema into preview-friendly browser data.
 
@@ -106,23 +189,135 @@ def _read_schema_preview(schema_path: Path | None) -> dict[str, Any]:
             "schemaPreviewError": None,
         }
 
-    try:
-        contents = schema_path.read_text(encoding="utf-8")
-        parsed = json.loads(contents)
-        preview = json.dumps(parsed, indent=2, ensure_ascii=True)
-        return {
-            "activeSchema": schema_path.name,
-            "activeSchemaPath": str(schema_path),
-            "schemaPreview": preview,
-            "schemaPreviewError": None,
-        }
-    except Exception as error:  # noqa: BLE001
+    parsed, error = _read_json_file(schema_path)
+    if parsed is None:
         return {
             "activeSchema": schema_path.name,
             "activeSchemaPath": str(schema_path),
             "schemaPreview": "",
-            "schemaPreviewError": str(error),
+            "schemaPreviewError": error,
         }
+
+    return {
+        "activeSchema": schema_path.name,
+        "activeSchemaPath": str(schema_path),
+        "schemaPreview": json.dumps(parsed, indent=2, ensure_ascii=True),
+        "schemaPreviewError": None,
+    }
+
+
+def _relative_path(path: Path | None, root_path: Path | None) -> str | None:
+    """Builds a relative display path.
+
+    Args:
+        path: Absolute path to convert.
+        root_path: Root folder for relative formatting.
+
+    Returns:
+        Relative path text if possible, otherwise the absolute path string.
+    """
+
+    if path is None:
+        return None
+
+    if root_path is None:
+        return str(path)
+
+    try:
+        return str(path.relative_to(root_path))
+    except ValueError:
+        return str(path)
+
+
+def _ensure_active_document(state: AppState) -> None:
+    """Ensures there is a sensible active document after a scan or refresh.
+
+    Args:
+        state: Shared application state.
+    """
+
+    if state.scan_result is None or not state.scan_result.documents:
+        state.active_document = None
+        return
+
+    available_documents = set(state.scan_result.documents)
+    if state.active_document not in available_documents:
+        state.active_document = state.scan_result.documents[0]
+
+
+def _ensure_review_record(state: AppState, document_path: Path | None) -> None:
+    """Initializes or syncs in-memory review data for a document.
+
+    Args:
+        state: Shared application state.
+        document_path: Document that should have an editable review record.
+    """
+
+    if document_path is None:
+        return
+
+    schema_fields, _ = _load_schema_definition(state.active_schema)
+    categories_path = state.scan_result.categories_file if state.scan_result else None
+    categories, _ = _load_categories_definition(categories_path)
+
+    record = state.review_data.setdefault(
+        str(document_path),
+        {"fields": {}, "categories": {}},
+    )
+
+    for field in schema_fields:
+        record["fields"].setdefault(field["name"], "")
+
+    for category in categories:
+        default_value: Any = "" if category["kind"] == "select" else False
+        record["categories"].setdefault(category["name"], default_value)
+
+
+def _build_review_payload(state: AppState) -> dict[str, Any]:
+    """Builds review workspace data for the selected document.
+
+    Args:
+        state: Shared application state.
+
+    Returns:
+        Review workspace data for browser rendering.
+    """
+
+    schema_fields, schema_error = _load_schema_definition(state.active_schema)
+    categories_path = state.scan_result.categories_file if state.scan_result else None
+    category_definitions, categories_error = _load_categories_definition(categories_path)
+
+    _ensure_review_record(state, state.active_document)
+
+    record = state.review_data.get(str(state.active_document), {"fields": {}, "categories": {}})
+    fields_payload = [
+        {
+            **field,
+            "value": record["fields"].get(field["name"], ""),
+        }
+        for field in schema_fields
+    ]
+    categories_payload = [
+        {
+            **category,
+            "value": record["categories"].get(
+                category["name"],
+                "" if category["kind"] == "select" else False,
+            ),
+        }
+        for category in category_definitions
+    ]
+
+    return {
+        "activeDocument": _relative_path(
+            state.active_document,
+            state.scan_result.root_path if state.scan_result else None,
+        ),
+        "reviewFields": fields_payload,
+        "reviewCategories": categories_payload,
+        "reviewSchemaError": schema_error,
+        "reviewCategoriesError": categories_error,
+    }
 
 
 def _serialize_state(state: AppState) -> dict[str, Any]:
@@ -139,6 +334,7 @@ def _serialize_state(state: AppState) -> dict[str, Any]:
         "statusMessage": state.status_message,
         **_serialize_scan_result(state.scan_result),
         **_read_schema_preview(state.active_schema),
+        **_build_review_payload(state),
     }
 
 
@@ -187,6 +383,9 @@ def _scan_selected_folder(state: AppState, folder: Path) -> None:
     if state.active_schema not in available_schemas:
         state.active_schema = get_default_active_schema(state.scan_result.schema_files)
 
+    _ensure_active_document(state)
+    _ensure_review_record(state, state.active_document)
+
     document_count = state.scan_result.document_count
     if document_count == 0:
         state.status_message = (
@@ -216,10 +415,71 @@ def _set_active_schema(state: AppState, schema_name: str) -> None:
     for schema_path in state.scan_result.schema_files:
         if schema_path.name == schema_name:
             state.active_schema = schema_path
+            _ensure_review_record(state, state.active_document)
             state.status_message = f"Active schema set to {schema_name}."
             return
 
     raise ValueError(f"Schema not found: {schema_name}")
+
+
+def _set_active_document(state: AppState, document_relative_path: str) -> None:
+    """Sets the active document from the current scan result.
+
+    Args:
+        state: Shared application state.
+        document_relative_path: Relative path selected in the UI.
+
+    Raises:
+        RuntimeError: If no folder has been scanned yet.
+        ValueError: If the requested document does not exist.
+    """
+
+    if state.scan_result is None:
+        raise RuntimeError("Choose a folder before selecting a document.")
+
+    for document_path in state.scan_result.documents:
+        relative_path = _relative_path(document_path, state.scan_result.root_path)
+        if relative_path == document_relative_path:
+            state.active_document = document_path
+            _ensure_review_record(state, state.active_document)
+            state.status_message = f"Selected document: {document_relative_path}"
+            return
+
+    raise ValueError(f"Document not found: {document_relative_path}")
+
+
+def _update_field_value(state: AppState, field_name: str, value: str) -> None:
+    """Updates an in-memory field value for the active document.
+
+    Args:
+        state: Shared application state.
+        field_name: Field name being edited.
+        value: New field value.
+    """
+
+    _ensure_review_record(state, state.active_document)
+    if state.active_document is None:
+        raise RuntimeError("Select a document before editing fields.")
+
+    state.review_data[str(state.active_document)]["fields"][field_name] = value
+    state.status_message = f"Updated field: {field_name}"
+
+
+def _update_category_value(state: AppState, category_name: str, value: Any) -> None:
+    """Updates an in-memory category value for the active document.
+
+    Args:
+        state: Shared application state.
+        category_name: Category being edited.
+        value: New category value.
+    """
+
+    _ensure_review_record(state, state.active_document)
+    if state.active_document is None:
+        raise RuntimeError("Select a document before editing categories.")
+
+    state.review_data[str(state.active_document)]["categories"][category_name] = value
+    state.status_message = f"Updated category: {category_name}"
 
 
 def _open_in_system_editor(file_path: Path) -> None:
@@ -232,8 +492,18 @@ def _open_in_system_editor(file_path: Path) -> None:
     subprocess.run(["open", str(file_path)], check=True)
 
 
+def _open_in_system_viewer(file_path: Path) -> None:
+    """Opens a document using the macOS default viewer.
+
+    Args:
+        file_path: Document file that should be opened.
+    """
+
+    subprocess.run(["open", str(file_path)], check=True)
+
+
 class DataLabelerHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for the local Story 2 web app."""
+    """HTTP request handler for the local Story 3 web app."""
 
     app_state: AppState
 
@@ -252,7 +522,7 @@ class DataLabelerHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def do_POST(self) -> None:  # noqa: N802
-        """Handles POST requests for Story 2 actions."""
+        """Handles POST requests for Story 3 actions."""
 
         parsed = urlparse(self.path)
 
@@ -296,6 +566,43 @@ class DataLabelerHandler(BaseHTTPRequestHandler):
                 _open_in_system_editor(self.app_state.active_schema)
                 self.app_state.status_message = (
                     f"Opened {self.app_state.active_schema.name} in the system editor."
+                )
+                self._send_json({"ok": True, **_serialize_state(self.app_state)})
+                return
+
+            if parsed.path == "/api/open-active-document":
+                if self.app_state.active_document is None:
+                    raise RuntimeError("No active document selected.")
+
+                _open_in_system_viewer(self.app_state.active_document)
+                self.app_state.status_message = (
+                    f"Opened {self.app_state.active_document.name} in the system viewer."
+                )
+                self._send_json({"ok": True, **_serialize_state(self.app_state)})
+                return
+
+            if parsed.path == "/api/select-document":
+                body = self._read_json_body()
+                _set_active_document(self.app_state, body.get("documentPath", ""))
+                self._send_json({"ok": True, **_serialize_state(self.app_state)})
+                return
+
+            if parsed.path == "/api/update-field":
+                body = self._read_json_body()
+                _update_field_value(
+                    self.app_state,
+                    body.get("fieldName", ""),
+                    body.get("value", ""),
+                )
+                self._send_json({"ok": True, **_serialize_state(self.app_state)})
+                return
+
+            if parsed.path == "/api/update-category":
+                body = self._read_json_body()
+                _update_category_value(
+                    self.app_state,
+                    body.get("categoryName", ""),
+                    body.get("value"),
                 )
                 self._send_json({"ok": True, **_serialize_state(self.app_state)})
                 return
@@ -359,7 +666,7 @@ class DataLabelerHandler(BaseHTTPRequestHandler):
 
 
 def _build_html() -> str:
-    """Builds the single-page Story 2 user interface.
+    """Builds the single-page Story 3 user interface.
 
     Returns:
         The full HTML document used by the local browser UI.
@@ -396,7 +703,7 @@ def _build_html() -> str:
         color: var(--ink);
       }
       .app {
-        max-width: 1480px;
+        max-width: 1520px;
         margin: 0 auto;
         padding: 24px;
       }
@@ -423,7 +730,7 @@ def _build_html() -> str:
       .subtitle {
         margin: 10px 0 0;
         color: var(--muted);
-        max-width: 920px;
+        max-width: 960px;
         line-height: 1.5;
       }
       .controls {
@@ -431,6 +738,11 @@ def _build_html() -> str:
         gap: 12px;
         flex-wrap: wrap;
         margin: 20px 0;
+      }
+      .top-nav {
+        display: flex;
+        gap: 12px;
+        margin: 0 0 20px;
       }
       button {
         border: 1px solid #bcd0ff;
@@ -447,6 +759,10 @@ def _build_html() -> str:
         background: #fff;
         color: var(--ink);
       }
+      button.nav-active {
+        background: var(--blue-soft);
+        color: var(--blue);
+      }
       button:disabled {
         opacity: 0.6;
         cursor: not-allowed;
@@ -459,12 +775,24 @@ def _build_html() -> str:
         border: 1px solid var(--border);
         color: var(--muted);
       }
-      .grid {
+      .grid-setup {
         display: grid;
         grid-template-columns: 360px 420px 1fr;
         gap: 20px;
       }
+      .grid-review {
+        display: grid;
+        grid-template-columns: 360px 1fr;
+        gap: 20px;
+      }
       .panel { padding: 20px; }
+      .panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
       .summary-grid {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -508,6 +836,14 @@ def _build_html() -> str:
         border-bottom: 1px solid var(--border);
         font-weight: 700;
       }
+      .list-header.categories-header {
+        background: var(--teal-soft);
+        color: var(--teal);
+      }
+      .list-header.fields-header {
+        background: var(--blue-soft);
+        color: var(--blue);
+      }
       .list-content {
         max-height: 560px;
         overflow: auto;
@@ -522,17 +858,16 @@ def _build_html() -> str:
       }
       .row:last-child { border-bottom: 0; }
       .empty { color: var(--muted); }
-      .schema-title {
-        font-weight: 700;
-      }
-      .schema-controls {
+      .schema-title { font-weight: 700; }
+      .schema-controls, .doc-controls {
         display: flex;
         gap: 8px;
         margin-top: 10px;
         align-items: center;
+        flex-wrap: wrap;
       }
       .preview {
-        max-height: 560px;
+        max-height: 320px;
         overflow: auto;
         margin: 0;
         padding: 16px;
@@ -543,107 +878,214 @@ def _build_html() -> str:
         line-height: 1.5;
         white-space: pre-wrap;
       }
+      .workspace {
+        display: none;
+      }
+      .workspace.active {
+        display: block;
+      }
+      .field-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+        margin-top: 16px;
+      }
+      .field-card {
+        background: var(--panel-alt);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 14px;
+      }
+      .field-card label {
+        display: block;
+        font-size: 13px;
+        font-weight: 700;
+        margin-bottom: 8px;
+      }
+      .field-card .field-description {
+        color: var(--muted);
+        font-size: 12px;
+        margin-bottom: 10px;
+      }
+      input[type="text"], input[type="url"], select, textarea {
+        width: 100%;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px 12px;
+        font: inherit;
+        background: #fff;
+      }
+      textarea {
+        min-height: 96px;
+        resize: vertical;
+      }
+      .category-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+        margin-top: 16px;
+      }
+      .placeholder-actions {
+        margin-top: 20px;
+        display: flex;
+        gap: 12px;
+      }
       @media (max-width: 1180px) {
-        .grid { grid-template-columns: 1fr; }
-        .summary-grid { grid-template-columns: 1fr; }
+        .grid-setup, .grid-review, .summary-grid, .field-grid, .category-grid {
+          grid-template-columns: 1fr;
+        }
       }
     </style>
   </head>
   <body>
     <main class="app">
       <section class="header">
-        <p class="eyebrow">Story 2</p>
+        <p class="eyebrow">Story 3</p>
         <h1>D2R Data Labeler</h1>
         <p class="subtitle">
-          Choose a local folder, review detected schemas, mark one as active,
-          preview it read-only in the app, and open it in your system editor.
+          Choose a folder, select the active schema, and manually review
+          document fields and categories in a dedicated workspace.
         </p>
       </section>
 
-      <p id="status" class="status">Loading application state...</p>
-
-      <div class="controls">
-        <button id="choose-folder">Choose Folder</button>
-        <button id="refresh-folder" class="secondary" disabled>Refresh Folder</button>
+      <div class="top-nav">
+        <button id="nav-setup" class="nav-active">Setup & Schema</button>
+        <button id="nav-review" class="secondary">Workspace Review</button>
       </div>
 
-      <section class="grid">
-        <div class="panel">
-          <h2>Folder Summary</h2>
-          <p class="subtitle" id="selected-folder">No folder selected.</p>
-          <p class="subtitle">
-            Shared support files from:
-            <strong id="support-folder">No support folder selected.</strong>
-          </p>
+      <p id="status" class="status">Loading application state...</p>
 
-          <div class="summary-grid" style="margin-top: 20px;">
-            <article class="summary-card">
-              <span class="badge amber">Documents</span>
-              <p class="summary-label">Supported files</p>
-              <p id="document-count" class="summary-value">0</p>
-            </article>
-            <article class="summary-card">
-              <span class="badge blue">Schemas</span>
-              <p class="summary-label">Detected schema files</p>
-              <p id="schema-count" class="summary-value">0</p>
-            </article>
-            <article class="summary-card">
-              <span class="badge teal">Categories</span>
-              <p class="summary-label">Shared config</p>
-              <p id="categories-file" class="summary-value">Not found</p>
-            </article>
-            <article class="summary-card">
-              <span class="badge blue">Labels</span>
-              <p class="summary-label">Existing output</p>
-              <p id="labels-file" class="summary-value">Not found</p>
-            </article>
-          </div>
-
-          <div class="list-shell" style="margin-top: 20px;">
-            <div class="list-header">Warnings</div>
-            <div id="warning-list" class="list-content"></div>
-          </div>
+      <section id="workspace-setup" class="workspace active">
+        <div class="controls">
+          <button id="choose-folder">Choose Folder</button>
+          <button id="refresh-folder" class="secondary" disabled>Refresh Folder</button>
         </div>
 
-        <div class="panel">
-          <h2>Schema List</h2>
-          <p class="subtitle">
-            The active schema controls later extraction behavior. Editing still
-            happens outside the app.
-          </p>
+        <div class="grid-setup">
+          <div class="panel">
+            <h2>Folder Summary</h2>
+            <p class="subtitle" id="selected-folder">No folder selected.</p>
+            <p class="subtitle">
+              Shared support files from:
+              <strong id="support-folder">No support folder selected.</strong>
+            </p>
 
-          <div class="controls">
-            <button id="refresh-schemas" class="secondary" disabled>Refresh Schemas</button>
-            <button id="open-active-schema" class="secondary" disabled>Open Active Schema</button>
+            <div class="summary-grid" style="margin-top: 20px;">
+              <article class="summary-card">
+                <span class="badge amber">Documents</span>
+                <p class="summary-label">Supported files</p>
+                <p id="document-count" class="summary-value">0</p>
+              </article>
+              <article class="summary-card">
+                <span class="badge blue">Schemas</span>
+                <p class="summary-label">Detected schema files</p>
+                <p id="schema-count" class="summary-value">0</p>
+              </article>
+              <article class="summary-card">
+                <span class="badge teal">Categories</span>
+                <p class="summary-label">Shared config</p>
+                <p id="categories-file" class="summary-value">Not found</p>
+              </article>
+              <article class="summary-card">
+                <span class="badge blue">Labels</span>
+                <p class="summary-label">Existing output</p>
+                <p id="labels-file" class="summary-value">Not found</p>
+              </article>
+            </div>
+
+            <div class="list-shell" style="margin-top: 20px;">
+              <div class="list-header">Warnings</div>
+              <div id="warning-list" class="list-content"></div>
+            </div>
           </div>
 
-          <div class="list-shell">
-            <div class="list-header">Available Schemas</div>
-            <div id="schema-list" class="list-content"></div>
+          <div class="panel">
+            <h2>Schema List</h2>
+            <p class="subtitle">
+              Choose the active schema here. Editing still happens outside the app.
+            </p>
+
+            <div class="controls">
+              <button id="refresh-schemas" class="secondary" disabled>Refresh Schemas</button>
+              <button id="open-active-schema" class="secondary" disabled>Open Active Schema</button>
+            </div>
+
+            <div class="list-shell">
+              <div class="list-header">Available Schemas</div>
+              <div id="schema-list" class="list-content"></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h2>Active Schema Preview</h2>
+            <p class="subtitle">
+              Read-only preview of the active schema and the documents available for review.
+            </p>
+
+            <div class="list-shell" style="margin-top: 20px;">
+              <div class="list-header" id="active-schema-name">No active schema selected</div>
+              <pre id="schema-preview" class="preview">No active schema selected.</pre>
+            </div>
           </div>
         </div>
+      </section>
 
-        <div class="panel">
-          <h2>Active Schema Preview</h2>
-          <p class="subtitle">
-            Read-only preview of the currently active schema plus the current
-            document list for the selected working set.
-          </p>
+      <section id="workspace-review" class="workspace">
+        <div class="grid-review">
+          <div class="panel">
+            <h2>Documents</h2>
+            <p class="subtitle">
+              Select a document to populate the manual review controls.
+            </p>
 
-          <div class="list-shell" style="margin-top: 20px;">
-            <div class="list-header" id="active-schema-name">No active schema selected</div>
-            <pre id="schema-preview" class="preview">No active schema selected.</pre>
+            <div class="list-shell" style="margin-top: 20px;">
+              <div class="list-header">Review Queue</div>
+              <div id="document-review-list" class="list-content"></div>
+            </div>
           </div>
 
-          <div class="list-shell" style="margin-top: 20px;">
-            <div class="list-header">Discovered Documents</div>
-            <div id="document-list" class="list-content"></div>
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Review Workspace</h2>
+              <button id="open-active-document" class="secondary" disabled>Open in Viewer</button>
+            </div>
+            <p class="subtitle" id="active-document-label">
+              No document selected.
+            </p>
+
+            <div class="list-shell" style="margin-top: 20px;">
+              <div class="list-header categories-header">Categories</div>
+              <div style="padding: 16px; background: #fff;">
+                <p id="categories-error" class="subtitle" style="margin: 0;"></p>
+                <div id="category-grid" class="category-grid"></div>
+              </div>
+            </div>
+
+            <div class="list-shell" style="margin-top: 20px;">
+              <div class="list-header fields-header">Fields</div>
+              <div style="padding: 16px; background: #fff;">
+                <p id="fields-error" class="subtitle" style="margin: 0;"></p>
+                <div id="field-grid" class="field-grid"></div>
+              </div>
+            </div>
+
+            <div class="placeholder-actions">
+              <button class="secondary" disabled>Save Draft (Story 4)</button>
+              <button disabled>Save Review (Story 4)</button>
+            </div>
           </div>
         </div>
       </section>
     </main>
 
     <script>
+      const state = { activeView: "setup" };
+
+      const setupView = document.querySelector("#workspace-setup");
+      const reviewView = document.querySelector("#workspace-review");
+      const navSetupButton = document.querySelector("#nav-setup");
+      const navReviewButton = document.querySelector("#nav-review");
+
       const statusEl = document.querySelector("#status");
       const selectedFolderEl = document.querySelector("#selected-folder");
       const supportFolderEl = document.querySelector("#support-folder");
@@ -655,11 +1097,27 @@ def _build_html() -> str:
       const schemaListEl = document.querySelector("#schema-list");
       const activeSchemaNameEl = document.querySelector("#active-schema-name");
       const schemaPreviewEl = document.querySelector("#schema-preview");
-      const documentListEl = document.querySelector("#document-list");
+      const documentReviewListEl = document.querySelector("#document-review-list");
+      const activeDocumentLabelEl = document.querySelector("#active-document-label");
+      const categoryGridEl = document.querySelector("#category-grid");
+      const fieldGridEl = document.querySelector("#field-grid");
+      const categoriesErrorEl = document.querySelector("#categories-error");
+      const fieldsErrorEl = document.querySelector("#fields-error");
+      const openActiveDocumentButton = document.querySelector("#open-active-document");
+
       const chooseFolderButton = document.querySelector("#choose-folder");
       const refreshFolderButton = document.querySelector("#refresh-folder");
       const refreshSchemasButton = document.querySelector("#refresh-schemas");
       const openActiveSchemaButton = document.querySelector("#open-active-schema");
+
+      function setActiveView(viewName) {
+        state.activeView = viewName;
+        const setupActive = viewName === "setup";
+        setupView.classList.toggle("active", setupActive);
+        reviewView.classList.toggle("active", !setupActive);
+        navSetupButton.className = setupActive ? "nav-active" : "secondary";
+        navReviewButton.className = setupActive ? "secondary" : "nav-active";
+      }
 
       async function requestJson(url, options = {}) {
         const response = await fetch(url, options);
@@ -731,6 +1189,189 @@ def _build_html() -> str:
         }
       }
 
+      function renderDocumentReviewRows(payload) {
+        documentReviewListEl.innerHTML = "";
+        if (!payload.documents.length) {
+          const row = document.createElement("div");
+          row.className = "row empty";
+          row.textContent = "No supported documents found";
+          documentReviewListEl.appendChild(row);
+          return;
+        }
+
+        for (const documentPath of payload.documents) {
+          const row = document.createElement("div");
+          row.className = "row";
+
+          const title = document.createElement("div");
+          title.className = "schema-title";
+          title.textContent = documentPath;
+          row.appendChild(title);
+
+          const controls = document.createElement("div");
+          controls.className = "doc-controls";
+
+          if (payload.activeDocument === documentPath) {
+            const badge = document.createElement("span");
+            badge.className = "badge blue";
+            badge.textContent = "Selected";
+            controls.appendChild(badge);
+          } else {
+            const button = document.createElement("button");
+            button.className = "secondary";
+            button.textContent = "Select";
+            button.addEventListener("click", async () => {
+              statusEl.textContent = `Selecting ${documentPath}...`;
+              const nextPayload = await requestJson("/api/select-document", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ documentPath })
+              });
+              renderState(nextPayload);
+            });
+            controls.appendChild(button);
+          }
+
+          row.appendChild(controls);
+          documentReviewListEl.appendChild(row);
+        }
+      }
+
+      function renderCategories(payload) {
+        categoriesErrorEl.textContent = payload.reviewCategoriesError
+          ? `Categories unavailable: ${payload.reviewCategoriesError}`
+          : "";
+        categoryGridEl.innerHTML = "";
+
+        if (!payload.reviewCategories.length) {
+          const empty = document.createElement("p");
+          empty.className = "subtitle";
+          empty.textContent = "No categories configured for this folder.";
+          categoryGridEl.appendChild(empty);
+          return;
+        }
+
+        for (const category of payload.reviewCategories) {
+          const card = document.createElement("div");
+          card.className = "field-card";
+
+          const label = document.createElement("label");
+          label.textContent = category.name;
+          card.appendChild(label);
+
+          if (category.description) {
+            const description = document.createElement("div");
+            description.className = "field-description";
+            description.textContent = category.description;
+            card.appendChild(description);
+          }
+
+          if (category.kind === "select") {
+            const select = document.createElement("select");
+
+            const emptyOption = document.createElement("option");
+            emptyOption.value = "";
+            emptyOption.textContent = "Choose...";
+            select.appendChild(emptyOption);
+
+            for (const optionValue of category.options) {
+              const option = document.createElement("option");
+              option.value = optionValue;
+              option.textContent = optionValue;
+              if (category.value === optionValue) {
+                option.selected = true;
+              }
+              select.appendChild(option);
+            }
+
+            select.addEventListener("change", async (event) => {
+              const nextPayload = await requestJson("/api/update-category", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  categoryName: category.name,
+                  value: event.target.value
+                })
+              });
+              renderState(nextPayload);
+            });
+            card.appendChild(select);
+          } else {
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.checked = Boolean(category.value);
+            checkbox.addEventListener("change", async (event) => {
+              const nextPayload = await requestJson("/api/update-category", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  categoryName: category.name,
+                  value: event.target.checked
+                })
+              });
+              renderState(nextPayload);
+            });
+            card.appendChild(checkbox);
+          }
+
+          categoryGridEl.appendChild(card);
+        }
+      }
+
+      function renderFields(payload) {
+        fieldsErrorEl.textContent = payload.reviewSchemaError
+          ? `Fields unavailable: ${payload.reviewSchemaError}`
+          : "";
+        fieldGridEl.innerHTML = "";
+
+        if (!payload.reviewFields.length) {
+          const empty = document.createElement("p");
+          empty.className = "subtitle";
+          empty.textContent = "No schema fields available.";
+          fieldGridEl.appendChild(empty);
+          return;
+        }
+
+        for (const field of payload.reviewFields) {
+          const card = document.createElement("div");
+          card.className = "field-card";
+
+          const label = document.createElement("label");
+          label.textContent = field.label;
+          card.appendChild(label);
+
+          if (field.description) {
+            const description = document.createElement("div");
+            description.className = "field-description";
+            description.textContent = field.description;
+            card.appendChild(description);
+          }
+
+          const input = field.name === "other"
+            ? document.createElement("textarea")
+            : document.createElement("input");
+
+          if (input.tagName === "INPUT") {
+            input.type = field.type === "url" ? "url" : "text";
+          }
+          input.value = field.value || "";
+          input.addEventListener("change", async (event) => {
+            const nextPayload = await requestJson("/api/update-field", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                fieldName: field.name,
+                value: event.target.value
+              })
+            });
+            renderState(nextPayload);
+          });
+
+          card.appendChild(input);
+          fieldGridEl.appendChild(card);
+        }
+      }
+
       function renderState(payload) {
         statusEl.textContent = payload.statusMessage;
         selectedFolderEl.textContent = payload.selectedFolder || "No folder selected.";
@@ -742,20 +1383,30 @@ def _build_html() -> str:
         refreshFolderButton.disabled = !payload.selectedFolder;
         refreshSchemasButton.disabled = !payload.selectedFolder;
         openActiveSchemaButton.disabled = !payload.activeSchema;
+        openActiveDocumentButton.disabled = !payload.activeDocument;
+        navReviewButton.disabled = !payload.selectedFolder;
         activeSchemaNameEl.textContent = payload.activeSchema || "No active schema selected";
         schemaPreviewEl.textContent = payload.schemaPreviewError
           ? `Preview unavailable: ${payload.schemaPreviewError}`
           : payload.schemaPreview;
+        activeDocumentLabelEl.textContent = payload.activeDocument
+          ? `Selected document: ${payload.activeDocument}`
+          : "No document selected.";
 
         renderSchemaRows(payload);
-        renderRows(documentListEl, payload.documents, "No supported documents found");
+        renderDocumentReviewRows(payload);
         renderRows(warningListEl, payload.warnings, "No warnings");
+        renderCategories(payload);
+        renderFields(payload);
       }
 
       async function loadState() {
         const payload = await requestJson("/api/state");
         renderState(payload);
       }
+
+      navSetupButton.addEventListener("click", () => setActiveView("setup"));
+      navReviewButton.addEventListener("click", () => setActiveView("review"));
 
       chooseFolderButton.addEventListener("click", async () => {
         statusEl.textContent = "Opening folder picker...";
@@ -778,6 +1429,12 @@ def _build_html() -> str:
       openActiveSchemaButton.addEventListener("click", async () => {
         statusEl.textContent = "Opening active schema...";
         const payload = await requestJson("/api/open-active-schema", { method: "POST" });
+        renderState(payload);
+      });
+
+      openActiveDocumentButton.addEventListener("click", async () => {
+        statusEl.textContent = "Opening active document...";
+        const payload = await requestJson("/api/open-active-document", { method: "POST" });
         renderState(payload);
       });
 
