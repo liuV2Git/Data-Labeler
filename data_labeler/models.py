@@ -12,14 +12,16 @@ class ScanResult:
 
     Attributes:
         root_path: Root folder selected by the user.
+        support_root: Folder supplying shared schema and config files.
         documents: Supported documents discovered recursively.
-        schema_files: Schema files discovered in the folder tree.
+        schema_files: Schema files discovered in the support folder.
         categories_file: Path to the categories configuration, if present.
         labels_file: Path to the labels output file, if present.
         warnings: Non-fatal scanning warnings collected during discovery.
     """
 
     root_path: Path
+    support_root: Path | None = None
     documents: list[Path] = field(default_factory=list)
     schema_files: list[Path] = field(default_factory=list)
     categories_file: Path | None = None

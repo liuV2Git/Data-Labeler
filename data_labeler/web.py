@@ -50,6 +50,7 @@ def _serialize_scan_result(result: ScanResult | None) -> dict[str, Any]:
     if result is None:
         return {
             "selectedFolder": None,
+            "supportFolder": None,
             "documents": [],
             "schemaFiles": [],
             "categoriesFile": None,
@@ -61,15 +62,19 @@ def _serialize_scan_result(result: ScanResult | None) -> dict[str, Any]:
 
     return {
         "selectedFolder": str(result.root_path),
+        "supportFolder": str(result.support_root) if result.support_root else None,
         "documents": format_relative_paths(result.documents, result.root_path),
-        "schemaFiles": format_relative_paths(result.schema_files, result.root_path),
+        "schemaFiles": format_relative_paths(
+            result.schema_files,
+            result.support_root or result.root_path,
+        ),
         "categoriesFile": (
-            str(result.categories_file.relative_to(result.root_path))
+            str(result.categories_file.relative_to(result.support_root or result.root_path))
             if result.categories_file
             else None
         ),
         "labelsFile": (
-            str(result.labels_file.relative_to(result.root_path))
+            str(result.labels_file.relative_to(result.support_root or result.root_path))
             if result.labels_file
             else None
         ),
@@ -505,6 +510,10 @@ def _build_html() -> str:
         <div class="panel">
           <h2>Folder Summary</h2>
           <p class="subtitle" id="selected-folder">No folder selected.</p>
+          <p class="subtitle">
+            Shared support files from:
+            <strong id="support-folder">No support folder selected.</strong>
+          </p>
 
           <div class="summary-grid" style="margin-top: 20px;">
             <article class="summary-card">
@@ -561,6 +570,7 @@ def _build_html() -> str:
     <script>
       const statusEl = document.querySelector("#status");
       const selectedFolderEl = document.querySelector("#selected-folder");
+      const supportFolderEl = document.querySelector("#support-folder");
       const documentCountEl = document.querySelector("#document-count");
       const schemaCountEl = document.querySelector("#schema-count");
       const categoriesFileEl = document.querySelector("#categories-file");
@@ -598,6 +608,7 @@ def _build_html() -> str:
       function renderState(payload) {
         statusEl.textContent = payload.statusMessage;
         selectedFolderEl.textContent = payload.selectedFolder || "No folder selected.";
+        supportFolderEl.textContent = payload.supportFolder || "No support folder selected.";
         documentCountEl.textContent = String(payload.documentCount);
         schemaCountEl.textContent = String(payload.schemaCount);
         categoriesFileEl.textContent = payload.categoriesFile || "Not found";
