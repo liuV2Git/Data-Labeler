@@ -1,0 +1,8 @@
+[project]
+name = "data-labeler"
+version = "0.1.0"
+description = "Internal desktop app for D2R Data Labeler story 1."
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["data_labeler"]
