@@ -1091,6 +1091,9 @@ def _build_html() -> str:
         gap: 20px;
         align-items: start;
       }
+      .review-shell.preview-hidden {
+        grid-template-columns: 1fr;
+      }
       .panel { padding: 20px; }
       .panel-header {
         display: flex;
@@ -1188,6 +1191,9 @@ def _build_html() -> str:
       .document-preview-shell {
         min-height: 740px;
         background: #fff;
+      }
+      .review-shell.preview-hidden .document-preview-shell {
+        display: none;
       }
       .document-preview-body {
         background: #f6f8fc;
@@ -1389,12 +1395,15 @@ def _build_html() -> str:
           <div class="panel">
             <div class="panel-header">
               <h2>Review Workspace</h2>
-              <button id="open-active-document" class="secondary" disabled>Open in Viewer</button>
+              <div class="doc-controls" style="margin-top: 0;">
+                <button id="toggle-preview" class="secondary">Hide Preview</button>
+                <button id="open-active-document" class="secondary" disabled>Open in Viewer</button>
+              </div>
             </div>
             <p class="subtitle" id="active-document-label">
               No document selected.
             </p>
-            <div class="review-shell" style="margin-top: 20px;">
+            <div id="review-shell" class="review-shell" style="margin-top: 20px;">
               <div class="list-shell document-preview-shell">
                 <div class="list-header" id="preview-title">Document Preview</div>
                 <div id="document-preview-body" class="document-preview-body"></div>
@@ -1430,7 +1439,7 @@ def _build_html() -> str:
     </main>
 
     <script>
-      const state = { activeView: "setup" };
+      const state = { activeView: "setup", previewVisible: true, lastPreviewPayload: null };
 
       const setupView = document.querySelector("#workspace-setup");
       const reviewView = document.querySelector("#workspace-review");
@@ -1450,6 +1459,7 @@ def _build_html() -> str:
       const schemaPreviewEl = document.querySelector("#schema-preview");
       const documentReviewListEl = document.querySelector("#document-review-list");
       const activeDocumentLabelEl = document.querySelector("#active-document-label");
+      const reviewShellEl = document.querySelector("#review-shell");
       const previewTitleEl = document.querySelector("#preview-title");
       const previewBodyEl = document.querySelector("#document-preview-body");
       const categoryGridEl = document.querySelector("#category-grid");
@@ -1457,6 +1467,7 @@ def _build_html() -> str:
       const categoriesErrorEl = document.querySelector("#categories-error");
       const fieldsErrorEl = document.querySelector("#fields-error");
       const openActiveDocumentButton = document.querySelector("#open-active-document");
+      const togglePreviewButton = document.querySelector("#toggle-preview");
       const extractDocumentButton = document.querySelector("#extract-document");
       const saveReviewButton = document.querySelector("#save-review");
 
@@ -1602,6 +1613,16 @@ def _build_html() -> str:
       }
 
       function renderPreview(payload) {
+        state.lastPreviewPayload = payload;
+        reviewShellEl.classList.toggle("preview-hidden", !state.previewVisible);
+        togglePreviewButton.textContent = state.previewVisible ? "Hide Preview" : "Show Preview";
+
+        if (!state.previewVisible) {
+          previewTitleEl.textContent = payload.previewTitle || "Document Preview";
+          previewBodyEl.innerHTML = "";
+          return;
+        }
+
         previewTitleEl.textContent = payload.previewTitle || "Document Preview";
         previewBodyEl.innerHTML = "";
 
@@ -1849,6 +1870,11 @@ def _build_html() -> str:
         statusEl.textContent = "Opening active document...";
         const payload = await requestJson("/api/open-active-document", { method: "POST" });
         renderState(payload);
+      });
+
+      togglePreviewButton.addEventListener("click", () => {
+        state.previewVisible = !state.previewVisible;
+        renderPreview(state.lastPreviewPayload || {});
       });
 
       loadState();
