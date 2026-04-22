@@ -56,6 +56,7 @@ class AppState:
     batch_extract_extracted: int = 0
     batch_extract_failed: int = 0
     batch_extract_skipped: int = 0
+    batch_extract_cancel_requested: bool = False
     batch_extract_status: str | None = None
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     status_message: str = (
@@ -295,6 +296,7 @@ def _reset_batch_extract_progress(state: AppState) -> None:
     state.batch_extract_extracted = 0
     state.batch_extract_failed = 0
     state.batch_extract_skipped = 0
+    state.batch_extract_cancel_requested = False
     state.batch_extract_status = None
 
 
@@ -309,6 +311,7 @@ def _batch_extract_payload(state: AppState) -> dict[str, Any]:
             "extracted": 0,
             "failed": 0,
             "skipped": 0,
+            "cancelRequested": False,
             "status": None,
             "summaryText": None,
         }
@@ -330,6 +333,7 @@ def _batch_extract_payload(state: AppState) -> dict[str, Any]:
         "extracted": state.batch_extract_extracted,
         "failed": state.batch_extract_failed,
         "skipped": state.batch_extract_skipped,
+        "cancelRequested": state.batch_extract_cancel_requested,
         "status": state.batch_extract_status,
         "summaryText": summary_text,
     }
@@ -817,11 +821,15 @@ def _run_batch_extraction(state: AppState, selected_paths: list[Path]) -> None:
     """Runs extraction for selected documents on a background thread."""
 
     selected_keys = {_document_key(document_path) for document_path in selected_paths}
+    canceled = False
 
     for document_path in selected_paths:
         document_key = _document_key(document_path)
 
         with state.lock:
+            if state.batch_extract_cancel_requested:
+                canceled = True
+                break
             _ensure_review_record(state, document_path)
             if document_key in state.reviewed_documents:
                 state.batch_extract_completed += 1
@@ -864,11 +872,19 @@ def _run_batch_extraction(state: AppState, selected_paths: list[Path]) -> None:
             if key not in state.reviewed_documents and key in selected_keys
         }
         state.batch_extract_running = False
-        state.batch_extract_status = (
-            f"Extract All complete. Extracted {state.batch_extract_extracted}, "
-            f"errors on {state.batch_extract_failed}, "
-            f"skipped {state.batch_extract_skipped} already saved."
-        )
+        if canceled:
+            state.batch_extract_status = (
+                f"Extraction canceled at {state.batch_extract_completed}/{state.batch_extract_total}. "
+                f"Extracted {state.batch_extract_extracted}, "
+                f"errors on {state.batch_extract_failed}, "
+                f"skipped {state.batch_extract_skipped} already saved."
+            )
+        else:
+            state.batch_extract_status = (
+                f"Extract All complete. Extracted {state.batch_extract_extracted}, "
+                f"errors on {state.batch_extract_failed}, "
+                f"skipped {state.batch_extract_skipped} already saved."
+            )
         state.status_message = state.batch_extract_status
 
 
@@ -898,6 +914,7 @@ def _extract_selected_documents(state: AppState) -> None:
     state.batch_extract_extracted = 0
     state.batch_extract_failed = 0
     state.batch_extract_skipped = 0
+    state.batch_extract_cancel_requested = False
     state.batch_extract_status = (
         f"Starting extraction for {state.batch_extract_total} selected documents..."
     )
@@ -909,6 +926,20 @@ def _extract_selected_documents(state: AppState) -> None:
         daemon=True,
     )
     worker.start()
+
+
+def _cancel_batch_extraction(state: AppState) -> None:
+    """Requests cancellation of a running batch extraction."""
+
+    if not state.batch_extract_running:
+        raise RuntimeError("No batch extraction is currently running.")
+
+    state.batch_extract_cancel_requested = True
+    state.batch_extract_status = (
+        f"Cancel requested. Finishing current document before stopping at "
+        f"{state.batch_extract_completed}/{state.batch_extract_total}."
+    )
+    state.status_message = state.batch_extract_status
 
 
 def _set_active_schema(state: AppState, schema_name: str) -> None:
@@ -1138,6 +1169,11 @@ class DataLabelerHandler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/extract-selected-documents":
                 _extract_selected_documents(self.app_state)
+                self._send_json({"ok": True, **_serialize_state(self.app_state)})
+                return
+
+            if parsed.path == "/api/cancel-extract-selected-documents":
+                _cancel_batch_extraction(self.app_state)
                 self._send_json({"ok": True, **_serialize_state(self.app_state)})
                 return
 
@@ -1647,6 +1683,7 @@ def _build_html() -> str:
               <button id="select-all-documents" class="secondary">Select All</button>
               <button id="clear-document-selection" class="secondary">Clear Selection</button>
               <button id="extract-selected-documents">Extract All Selected</button>
+              <button id="cancel-extract-selected-documents" class="secondary" disabled>Cancel Extraction</button>
             </div>
             <p id="queue-summary" class="queue-summary">
               No documents selected.
@@ -1740,6 +1777,7 @@ def _build_html() -> str:
       const selectAllDocumentsButton = document.querySelector("#select-all-documents");
       const clearDocumentSelectionButton = document.querySelector("#clear-document-selection");
       const extractSelectedDocumentsButton = document.querySelector("#extract-selected-documents");
+      const cancelExtractSelectedDocumentsButton = document.querySelector("#cancel-extract-selected-documents");
 
       const chooseFolderButton = document.querySelector("#choose-folder");
       const refreshFolderButton = document.querySelector("#refresh-folder");
@@ -2121,6 +2159,7 @@ def _build_html() -> str:
         openActiveDocumentButton.disabled = !payload.activeDocument;
         extractDocumentButton.disabled = batchRunning || !payload.activeDocument || !payload.activeSchema || payload.reviewedDocuments.includes(payload.activeDocument);
         extractSelectedDocumentsButton.disabled = batchRunning || !payload.activeSchema || payload.extractableDocumentCount === 0;
+        cancelExtractSelectedDocumentsButton.disabled = !batchRunning || Boolean(payload.batchExtraction && payload.batchExtraction.cancelRequested);
         selectAllDocumentsButton.disabled = batchRunning || !payload.documentQueue.length;
         clearDocumentSelectionButton.disabled = batchRunning || payload.selectedDocumentCount === 0;
         saveReviewButton.disabled = batchRunning || !payload.activeDocument;
@@ -2184,6 +2223,13 @@ def _build_html() -> str:
       extractSelectedDocumentsButton.addEventListener("click", async () => {
         statusEl.textContent = "Extracting selected documents...";
         const payload = await requestJson("/api/extract-selected-documents", { method: "POST" });
+        renderState(payload);
+        ensureBatchPolling(payload.batchExtraction);
+      });
+
+      cancelExtractSelectedDocumentsButton.addEventListener("click", async () => {
+        statusEl.textContent = "Canceling extraction...";
+        const payload = await requestJson("/api/cancel-extract-selected-documents", { method: "POST" });
         renderState(payload);
         ensureBatchPolling(payload.batchExtraction);
       });
