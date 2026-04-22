@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
+import traceback
 import webbrowser
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -14,6 +15,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any
 from urllib.parse import urlparse
 
+from data_labeler.extraction import extract_document_fields
 from data_labeler.models import ScanResult
 from data_labeler.scanner import (
     format_relative_paths,
@@ -579,6 +581,49 @@ def _save_active_review(state: AppState) -> None:
     state.status_message = f"Saved review for {state.active_document.name}."
 
 
+def _extract_active_document(state: AppState) -> None:
+    """Runs field extraction for the selected document and active schema.
+
+    Args:
+        state: Shared application state.
+
+    Raises:
+        RuntimeError: If the current review context is incomplete.
+    """
+
+    if state.active_document is None:
+        raise RuntimeError("Select a document before extracting.")
+
+    if state.active_schema is None:
+        raise RuntimeError("Select an active schema before extracting.")
+
+    result = extract_document_fields(state.active_document, state.active_schema)
+    _ensure_review_record(state, state.active_document)
+
+    review_record = state.review_data[str(state.active_document)]
+    for field_name, value in result.field_values.items():
+        review_record["fields"][field_name] = value
+
+    if result.mode == "openai":
+        state.status_message = (
+            f"Extraction complete for {state.active_document.name} using {result.model}."
+        )
+        return
+
+    if result.mode == "responses-api":
+        provider = result.provider or "responses-api"
+        state.status_message = (
+            f"Extraction complete for {state.active_document.name} using "
+            f"{provider} ({result.model})."
+        )
+        return
+
+    state.status_message = (
+        "Demo extraction complete. Start OCAT locally or configure OCA_TOKEN_FILE "
+        "for live extraction."
+    )
+
+
 def _set_active_schema(state: AppState, schema_name: str) -> None:
     """Sets the active schema from the current scan result.
 
@@ -789,12 +834,18 @@ class DataLabelerHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, **_serialize_state(self.app_state)})
                 return
 
+            if parsed.path == "/api/extract-document":
+                _extract_active_document(self.app_state)
+                self._send_json({"ok": True, **_serialize_state(self.app_state)})
+                return
+
             if parsed.path == "/api/save-review":
                 _save_active_review(self.app_state)
                 self._send_json({"ok": True, **_serialize_state(self.app_state)})
                 return
 
         except Exception as error:  # noqa: BLE001
+            traceback.print_exc()
             self.app_state.status_message = f"Error: {error}"
             self._send_json(
                 {"ok": False, **_serialize_state(self.app_state)},
@@ -1259,6 +1310,7 @@ def _build_html() -> str:
 
             <div class="placeholder-actions">
               <button class="secondary" disabled>Save Draft</button>
+              <button id="extract-document" class="secondary">Extract</button>
               <button id="save-review">Save Review</button>
             </div>
           </div>
@@ -1292,6 +1344,7 @@ def _build_html() -> str:
       const categoriesErrorEl = document.querySelector("#categories-error");
       const fieldsErrorEl = document.querySelector("#fields-error");
       const openActiveDocumentButton = document.querySelector("#open-active-document");
+      const extractDocumentButton = document.querySelector("#extract-document");
       const saveReviewButton = document.querySelector("#save-review");
 
       const chooseFolderButton = document.querySelector("#choose-folder");
@@ -1582,6 +1635,7 @@ def _build_html() -> str:
         refreshSchemasButton.disabled = !payload.selectedFolder;
         openActiveSchemaButton.disabled = !payload.activeSchema;
         openActiveDocumentButton.disabled = !payload.activeDocument;
+        extractDocumentButton.disabled = !payload.activeDocument || !payload.activeSchema;
         saveReviewButton.disabled = !payload.activeDocument;
         navReviewButton.disabled = !payload.selectedFolder;
         activeSchemaNameEl.textContent = payload.activeSchema || "No active schema selected";
@@ -1634,6 +1688,12 @@ def _build_html() -> str:
       saveReviewButton.addEventListener("click", async () => {
         statusEl.textContent = "Saving review...";
         const payload = await requestJson("/api/save-review", { method: "POST" });
+        renderState(payload);
+      });
+
+      extractDocumentButton.addEventListener("click", async () => {
+        statusEl.textContent = "Extracting fields...";
+        const payload = await requestJson("/api/extract-document", { method: "POST" });
         renderState(payload);
       });
 
