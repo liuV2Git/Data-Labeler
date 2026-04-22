@@ -46,7 +46,18 @@ class AppState:
     active_schema: Path | None = None
     active_document: Path | None = None
     review_data: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
+    selected_documents: set[str] = field(default_factory=set)
+    extracted_documents: set[str] = field(default_factory=set)
+    failed_documents: set[str] = field(default_factory=set)
     reviewed_documents: set[str] = field(default_factory=set)
+    batch_extract_running: bool = False
+    batch_extract_total: int = 0
+    batch_extract_completed: int = 0
+    batch_extract_extracted: int = 0
+    batch_extract_failed: int = 0
+    batch_extract_skipped: int = 0
+    batch_extract_status: str | None = None
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     status_message: str = (
         "Choose a folder to discover documents, select a schema, and begin review."
     )
@@ -234,6 +245,96 @@ def _relative_path(path: Path | None, root_path: Path | None) -> str | None:
         return str(path)
 
 
+def _document_key(document_path: Path) -> str:
+    """Builds a stable in-memory key for a document path."""
+
+    return str(document_path)
+
+
+def _find_document_by_relative_path(state: AppState, document_relative_path: str) -> Path:
+    """Finds a scanned document by its review-queue relative path."""
+
+    if state.scan_result is None:
+        raise RuntimeError("Choose a folder before selecting a document.")
+
+    for document_path in state.scan_result.documents:
+        relative_path = _relative_path(document_path, state.scan_result.root_path)
+        if relative_path == document_relative_path:
+            return document_path
+
+    raise ValueError(f"Document not found: {document_relative_path}")
+
+
+def _sync_document_state(state: AppState) -> None:
+    """Removes stale in-memory data after scanning or refreshing a folder."""
+
+    if state.scan_result is None:
+        state.review_data.clear()
+        state.selected_documents.clear()
+        state.extracted_documents.clear()
+        state.failed_documents.clear()
+        state.reviewed_documents.clear()
+        return
+
+    current_keys = {_document_key(document) for document in state.scan_result.documents}
+    state.review_data = {
+        key: value for key, value in state.review_data.items() if key in current_keys
+    }
+    state.selected_documents &= current_keys
+    state.extracted_documents &= current_keys
+    state.failed_documents &= current_keys
+    state.reviewed_documents &= current_keys
+
+
+def _reset_batch_extract_progress(state: AppState) -> None:
+    """Clears batch extraction progress metadata."""
+
+    state.batch_extract_running = False
+    state.batch_extract_total = 0
+    state.batch_extract_completed = 0
+    state.batch_extract_extracted = 0
+    state.batch_extract_failed = 0
+    state.batch_extract_skipped = 0
+    state.batch_extract_status = None
+
+
+def _batch_extract_payload(state: AppState) -> dict[str, Any]:
+    """Builds browser-facing progress data for batch extraction."""
+
+    if state.batch_extract_total == 0 and state.batch_extract_status is None:
+        return {
+            "running": False,
+            "total": 0,
+            "completed": 0,
+            "extracted": 0,
+            "failed": 0,
+            "skipped": 0,
+            "status": None,
+            "summaryText": None,
+        }
+
+    if state.batch_extract_running:
+        summary_text = (
+            f"{state.batch_extract_completed}/{state.batch_extract_total} documents processed. "
+            f"{state.batch_extract_extracted} extracted, "
+            f"{state.batch_extract_failed} errors, "
+            f"{state.batch_extract_skipped} skipped."
+        )
+    else:
+        summary_text = state.batch_extract_status
+
+    return {
+        "running": state.batch_extract_running,
+        "total": state.batch_extract_total,
+        "completed": state.batch_extract_completed,
+        "extracted": state.batch_extract_extracted,
+        "failed": state.batch_extract_failed,
+        "skipped": state.batch_extract_skipped,
+        "status": state.batch_extract_status,
+        "summaryText": summary_text,
+    }
+
+
 def _ensure_active_document(state: AppState) -> None:
     """Ensures there is a sensible active document after a scan or refresh.
 
@@ -313,15 +414,37 @@ def _build_review_payload(state: AppState) -> dict[str, Any]:
         for category in category_definitions
     ]
 
+    active_document_relative = _relative_path(
+        state.active_document,
+        state.scan_result.root_path if state.scan_result else None,
+    )
+    document_queue = []
+    if state.scan_result is not None:
+        for document_path in state.scan_result.documents:
+            document_relative = _relative_path(document_path, state.scan_result.root_path)
+            document_key = _document_key(document_path)
+            document_queue.append(
+                {
+                    "path": document_relative,
+                    "selected": document_key in state.selected_documents,
+                    "reviewed": document_key in state.reviewed_documents,
+                    "extracted": document_key in state.extracted_documents,
+                    "failed": document_key in state.failed_documents,
+                    "active": document_path == state.active_document,
+                }
+            )
+
     return {
-        "activeDocument": _relative_path(
-            state.active_document,
-            state.scan_result.root_path if state.scan_result else None,
-        ),
+        "activeDocument": active_document_relative,
         "reviewFields": fields_payload,
         "reviewCategories": categories_payload,
         "reviewSchemaError": schema_error,
         "reviewCategoriesError": categories_error,
+        "documentQueue": document_queue,
+        "selectedDocumentCount": len(state.selected_documents),
+        "extractableDocumentCount": sum(
+            1 for item in document_queue if item["selected"] and not item["reviewed"]
+        ),
         "reviewedDocuments": [
             _relative_path(Path(document_key), state.scan_result.root_path)
             for document_key in sorted(state.reviewed_documents)
@@ -341,6 +464,7 @@ def _serialize_state(state: AppState) -> dict[str, Any]:
 
     return {
         "statusMessage": state.status_message,
+        "batchExtraction": _batch_extract_payload(state),
         **_serialize_scan_result(state.scan_result),
         **_read_schema_preview(state.active_schema),
         **_build_review_payload(state),
@@ -387,6 +511,8 @@ def _scan_selected_folder(state: AppState, folder: Path) -> None:
 
     state.selected_folder = folder
     state.scan_result = scan_folder(folder)
+    _sync_document_state(state)
+    _reset_batch_extract_progress(state)
 
     available_schemas = set(state.scan_result.schema_files)
     if state.active_schema not in available_schemas:
@@ -439,6 +565,8 @@ def _load_saved_reviews(state: AppState) -> None:
     """
 
     state.reviewed_documents.clear()
+    state.extracted_documents.clear()
+    state.failed_documents.clear()
 
     if state.scan_result is None or state.scan_result.labels_file is None:
         return
@@ -489,9 +617,11 @@ def _load_saved_reviews(state: AppState) -> None:
             {
                 "schema_file": record.get("schema_file"),
                 "schema_path": record.get("schema_path"),
+                "extracted": True,
             }
         )
         state.reviewed_documents.add(document_key)
+        state.extracted_documents.add(document_key)
 
 
 def _build_labels_records(state: AppState) -> list[dict[str, Any]]:
@@ -563,7 +693,11 @@ def _save_active_review(state: AppState) -> None:
     )
 
     labels_path = _labels_path_for_state(state)
-    state.reviewed_documents.add(str(state.active_document))
+    active_key = _document_key(state.active_document)
+    state.reviewed_documents.add(active_key)
+    state.extracted_documents.add(active_key)
+    state.failed_documents.discard(active_key)
+    state.selected_documents.discard(active_key)
     payload = {"documents": _build_labels_records(state)}
 
     labels_path.parent.mkdir(parents=True, exist_ok=True)
@@ -597,12 +731,20 @@ def _extract_active_document(state: AppState) -> None:
     if state.active_schema is None:
         raise RuntimeError("Select an active schema before extracting.")
 
-    result = extract_document_fields(state.active_document, state.active_schema)
     _ensure_review_record(state, state.active_document)
+    active_key = _document_key(state.active_document)
+    if active_key in state.reviewed_documents:
+        raise RuntimeError("This document is already saved in labels.json.")
 
-    review_record = state.review_data[str(state.active_document)]
+    result = extract_document_fields(state.active_document, state.active_schema)
+
+    review_record = state.review_data[active_key]
     for field_name, value in result.field_values.items():
         review_record["fields"][field_name] = value
+    review_record.setdefault("meta", {})
+    review_record["meta"]["extracted"] = True
+    state.extracted_documents.add(active_key)
+    state.failed_documents.discard(active_key)
 
     if result.mode == "openai":
         state.status_message = (
@@ -622,6 +764,151 @@ def _extract_active_document(state: AppState) -> None:
         "Demo extraction complete. Start OCAT locally or configure OCA_TOKEN_FILE "
         "for live extraction."
     )
+
+
+def _select_all_documents(state: AppState) -> None:
+    """Selects all unsaved documents in the current review queue."""
+
+    if state.scan_result is None:
+        raise RuntimeError("Choose a folder before selecting documents.")
+    if state.batch_extract_running:
+        raise RuntimeError("Wait for batch extraction to finish before changing selection.")
+
+    state.selected_documents = {
+        _document_key(document_path)
+        for document_path in state.scan_result.documents
+        if _document_key(document_path) not in state.reviewed_documents
+    }
+    state.status_message = f"Selected {len(state.selected_documents)} documents for extraction."
+
+
+def _clear_document_selection(state: AppState) -> None:
+    """Clears all review-queue selections."""
+
+    if state.batch_extract_running:
+        raise RuntimeError("Wait for batch extraction to finish before changing selection.")
+    state.selected_documents.clear()
+    state.status_message = "Cleared document selection."
+
+
+def _toggle_document_selection(state: AppState, document_relative_path: str) -> None:
+    """Toggles whether a review-queue document is selected for batch extraction."""
+
+    if state.batch_extract_running:
+        raise RuntimeError("Wait for batch extraction to finish before changing selection.")
+
+    document_path = _find_document_by_relative_path(state, document_relative_path)
+    document_key = _document_key(document_path)
+
+    if document_key in state.reviewed_documents:
+        state.status_message = f"{document_path.name} is already saved and will be skipped."
+        return
+
+    if document_key in state.selected_documents:
+        state.selected_documents.remove(document_key)
+        state.status_message = f"Removed {document_relative_path} from selection."
+        return
+
+    state.selected_documents.add(document_key)
+    state.status_message = f"Selected {document_relative_path} for extraction."
+
+
+def _run_batch_extraction(state: AppState, selected_paths: list[Path]) -> None:
+    """Runs extraction for selected documents on a background thread."""
+
+    selected_keys = {_document_key(document_path) for document_path in selected_paths}
+
+    for document_path in selected_paths:
+        document_key = _document_key(document_path)
+
+        with state.lock:
+            _ensure_review_record(state, document_path)
+            if document_key in state.reviewed_documents:
+                state.batch_extract_completed += 1
+                state.batch_extract_skipped += 1
+                state.batch_extract_status = (
+                    f"Processing {state.batch_extract_completed}/{state.batch_extract_total} selected documents..."
+                )
+                continue
+
+        try:
+            result = extract_document_fields(document_path, state.active_schema)
+        except Exception:
+            with state.lock:
+                state.failed_documents.add(document_key)
+                state.batch_extract_completed += 1
+                state.batch_extract_failed += 1
+                state.batch_extract_status = (
+                    f"Processing {state.batch_extract_completed}/{state.batch_extract_total} selected documents..."
+                )
+            continue
+
+        with state.lock:
+            review_record = state.review_data[document_key]
+            for field_name, value in result.field_values.items():
+                review_record["fields"][field_name] = value
+            review_record.setdefault("meta", {})
+            review_record["meta"]["extracted"] = True
+            state.extracted_documents.add(document_key)
+            state.failed_documents.discard(document_key)
+            state.batch_extract_completed += 1
+            state.batch_extract_extracted += 1
+            state.batch_extract_status = (
+                f"Processing {state.batch_extract_completed}/{state.batch_extract_total} selected documents..."
+            )
+
+    with state.lock:
+        state.selected_documents = {
+            key
+            for key in state.selected_documents
+            if key not in state.reviewed_documents and key in selected_keys
+        }
+        state.batch_extract_running = False
+        state.batch_extract_status = (
+            f"Extract All complete. Extracted {state.batch_extract_extracted}, "
+            f"errors on {state.batch_extract_failed}, "
+            f"skipped {state.batch_extract_skipped} already saved."
+        )
+        state.status_message = state.batch_extract_status
+
+
+def _extract_selected_documents(state: AppState) -> None:
+    """Starts background extraction for all currently selected unsaved documents."""
+
+    if state.scan_result is None:
+        raise RuntimeError("Choose a folder before extracting documents.")
+
+    if state.active_schema is None:
+        raise RuntimeError("Select an active schema before extracting.")
+
+    if state.batch_extract_running:
+        raise RuntimeError("Batch extraction is already running.")
+
+    selected_paths = [
+        document_path
+        for document_path in state.scan_result.documents
+        if _document_key(document_path) in state.selected_documents
+    ]
+    if not selected_paths:
+        raise RuntimeError("Select at least one document before running Extract All.")
+
+    state.batch_extract_running = True
+    state.batch_extract_total = len(selected_paths)
+    state.batch_extract_completed = 0
+    state.batch_extract_extracted = 0
+    state.batch_extract_failed = 0
+    state.batch_extract_skipped = 0
+    state.batch_extract_status = (
+        f"Starting extraction for {state.batch_extract_total} selected documents..."
+    )
+    state.status_message = state.batch_extract_status
+
+    worker = threading.Thread(
+        target=_run_batch_extraction,
+        args=(state, selected_paths),
+        daemon=True,
+    )
+    worker.start()
 
 
 def _set_active_schema(state: AppState, schema_name: str) -> None:
@@ -661,18 +948,10 @@ def _set_active_document(state: AppState, document_relative_path: str) -> None:
         ValueError: If the requested document does not exist.
     """
 
-    if state.scan_result is None:
-        raise RuntimeError("Choose a folder before selecting a document.")
-
-    for document_path in state.scan_result.documents:
-        relative_path = _relative_path(document_path, state.scan_result.root_path)
-        if relative_path == document_relative_path:
-            state.active_document = document_path
-            _ensure_review_record(state, state.active_document)
-            state.status_message = f"Selected document: {document_relative_path}"
-            return
-
-    raise ValueError(f"Document not found: {document_relative_path}")
+    document_path = _find_document_by_relative_path(state, document_relative_path)
+    state.active_document = document_path
+    _ensure_review_record(state, state.active_document)
+    state.status_message = f"Selected document: {document_relative_path}"
 
 
 def _update_field_value(state: AppState, field_name: str, value: str) -> None:
@@ -814,6 +1093,24 @@ class DataLabelerHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, **_serialize_state(self.app_state)})
                 return
 
+            if parsed.path == "/api/toggle-document-selection":
+                body = self._read_json_body()
+                _toggle_document_selection(
+                    self.app_state, body.get("documentPath", "")
+                )
+                self._send_json({"ok": True, **_serialize_state(self.app_state)})
+                return
+
+            if parsed.path == "/api/select-all-documents":
+                _select_all_documents(self.app_state)
+                self._send_json({"ok": True, **_serialize_state(self.app_state)})
+                return
+
+            if parsed.path == "/api/clear-document-selection":
+                _clear_document_selection(self.app_state)
+                self._send_json({"ok": True, **_serialize_state(self.app_state)})
+                return
+
             if parsed.path == "/api/update-field":
                 body = self._read_json_body()
                 _update_field_value(
@@ -836,6 +1133,11 @@ class DataLabelerHandler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/extract-document":
                 _extract_active_document(self.app_state)
+                self._send_json({"ok": True, **_serialize_state(self.app_state)})
+                return
+
+            if parsed.path == "/api/extract-selected-documents":
+                _extract_selected_documents(self.app_state)
                 self._send_json({"ok": True, **_serialize_state(self.app_state)})
                 return
 
@@ -1105,6 +1407,70 @@ def _build_html() -> str:
         align-items: center;
         flex-wrap: wrap;
       }
+      .queue-toolbar {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-top: 18px;
+      }
+      .queue-summary {
+        margin: 12px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .batch-progress {
+        margin-top: 14px;
+        padding: 12px 14px;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        background: #fff;
+      }
+      .batch-progress.hidden {
+        display: none;
+      }
+      .batch-progress-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .batch-progress-title {
+        font-size: 13px;
+        font-weight: 700;
+      }
+      .batch-progress-detail {
+        margin: 8px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .progress-track {
+        margin-top: 10px;
+        width: 100%;
+        height: 10px;
+        background: var(--panel-alt);
+        border-radius: 999px;
+        overflow: hidden;
+      }
+      .progress-fill {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, var(--blue), #7ab2ff);
+        border-radius: 999px;
+        transition: width 180ms ease-out;
+      }
+      .doc-row-header {
+        display: flex;
+        gap: 10px;
+        align-items: flex-start;
+      }
+      .doc-checkbox {
+        margin-top: 3px;
+      }
+      .doc-title-group {
+        flex: 1;
+        min-width: 0;
+      }
       .preview {
         max-height: 320px;
         overflow: auto;
@@ -1274,8 +1640,27 @@ def _build_html() -> str:
           <div class="panel">
             <h2>Documents</h2>
             <p class="subtitle">
-              Select a document to populate the manual review controls.
+              Select documents first, run Extract All, then review each document one by one.
             </p>
+
+            <div class="queue-toolbar">
+              <button id="select-all-documents" class="secondary">Select All</button>
+              <button id="clear-document-selection" class="secondary">Clear Selection</button>
+              <button id="extract-selected-documents">Extract All Selected</button>
+            </div>
+            <p id="queue-summary" class="queue-summary">
+              No documents selected.
+            </p>
+            <div id="batch-progress" class="batch-progress hidden">
+              <div class="batch-progress-header">
+                <span class="batch-progress-title" id="batch-progress-title">Batch extraction</span>
+                <span class="badge blue" id="batch-progress-count">0/0</span>
+              </div>
+              <div class="progress-track">
+                <div id="batch-progress-fill" class="progress-fill"></div>
+              </div>
+              <p id="batch-progress-detail" class="batch-progress-detail"></p>
+            </div>
 
             <div class="list-shell" style="margin-top: 20px;">
               <div class="list-header">Review Queue</div>
@@ -1319,7 +1704,7 @@ def _build_html() -> str:
     </main>
 
     <script>
-      const state = { activeView: "setup" };
+      const state = { activeView: "setup", batchPollTimer: null };
 
       const setupView = document.querySelector("#workspace-setup");
       const reviewView = document.querySelector("#workspace-review");
@@ -1339,6 +1724,12 @@ def _build_html() -> str:
       const schemaPreviewEl = document.querySelector("#schema-preview");
       const documentReviewListEl = document.querySelector("#document-review-list");
       const activeDocumentLabelEl = document.querySelector("#active-document-label");
+      const queueSummaryEl = document.querySelector("#queue-summary");
+      const batchProgressEl = document.querySelector("#batch-progress");
+      const batchProgressTitleEl = document.querySelector("#batch-progress-title");
+      const batchProgressCountEl = document.querySelector("#batch-progress-count");
+      const batchProgressFillEl = document.querySelector("#batch-progress-fill");
+      const batchProgressDetailEl = document.querySelector("#batch-progress-detail");
       const categoryGridEl = document.querySelector("#category-grid");
       const fieldGridEl = document.querySelector("#field-grid");
       const categoriesErrorEl = document.querySelector("#categories-error");
@@ -1346,11 +1737,40 @@ def _build_html() -> str:
       const openActiveDocumentButton = document.querySelector("#open-active-document");
       const extractDocumentButton = document.querySelector("#extract-document");
       const saveReviewButton = document.querySelector("#save-review");
+      const selectAllDocumentsButton = document.querySelector("#select-all-documents");
+      const clearDocumentSelectionButton = document.querySelector("#clear-document-selection");
+      const extractSelectedDocumentsButton = document.querySelector("#extract-selected-documents");
 
       const chooseFolderButton = document.querySelector("#choose-folder");
       const refreshFolderButton = document.querySelector("#refresh-folder");
       const refreshSchemasButton = document.querySelector("#refresh-schemas");
       const openActiveSchemaButton = document.querySelector("#open-active-schema");
+
+      function stopBatchPolling() {
+        if (state.batchPollTimer) {
+          window.clearTimeout(state.batchPollTimer);
+          state.batchPollTimer = null;
+        }
+      }
+
+      async function pollBatchProgress() {
+        stopBatchPolling();
+        const payload = await requestJson("/api/state");
+        renderState(payload);
+        if (payload.batchExtraction && payload.batchExtraction.running) {
+          state.batchPollTimer = window.setTimeout(pollBatchProgress, 800);
+        }
+      }
+
+      function ensureBatchPolling(batchExtraction) {
+        if (batchExtraction && batchExtraction.running) {
+          if (!state.batchPollTimer) {
+            state.batchPollTimer = window.setTimeout(pollBatchProgress, 800);
+          }
+          return;
+        }
+        stopBatchPolling();
+      }
 
       function setActiveView(viewName) {
         state.activeView = viewName;
@@ -1433,7 +1853,8 @@ def _build_html() -> str:
 
       function renderDocumentReviewRows(payload) {
         documentReviewListEl.innerHTML = "";
-        if (!payload.documents.length) {
+        const batchRunning = Boolean(payload.batchExtraction && payload.batchExtraction.running);
+        if (!payload.documentQueue.length) {
           const row = document.createElement("div");
           row.className = "row empty";
           row.textContent = "No supported documents found";
@@ -1441,36 +1862,73 @@ def _build_html() -> str:
           return;
         }
 
-        for (const documentPath of payload.documents) {
+        for (const queueItem of payload.documentQueue) {
+          const documentPath = queueItem.path;
           const row = document.createElement("div");
           row.className = "row";
+
+          const header = document.createElement("div");
+          header.className = "doc-row-header";
+
+          if (!queueItem.reviewed) {
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.className = "doc-checkbox";
+            checkbox.checked = Boolean(queueItem.selected);
+            checkbox.disabled = batchRunning;
+            checkbox.addEventListener("change", async () => {
+              const nextPayload = await requestJson("/api/toggle-document-selection", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ documentPath })
+              });
+              renderState(nextPayload);
+            });
+            header.appendChild(checkbox);
+          }
+
+          const titleGroup = document.createElement("div");
+          titleGroup.className = "doc-title-group";
 
           const title = document.createElement("div");
           title.className = "schema-title";
           title.textContent = documentPath;
-          row.appendChild(title);
+          titleGroup.appendChild(title);
+          header.appendChild(titleGroup);
+          row.appendChild(header);
 
           const controls = document.createElement("div");
           controls.className = "doc-controls";
 
-          if (payload.activeDocument === documentPath) {
+          if (queueItem.active) {
             const badge = document.createElement("span");
             badge.className = "badge blue";
-            badge.textContent = "Selected";
+            badge.textContent = "Viewing";
             controls.appendChild(badge);
           }
 
-          if (payload.reviewedDocuments.includes(documentPath)) {
+          if (queueItem.reviewed) {
             const reviewedBadge = document.createElement("span");
             reviewedBadge.className = "badge reviewed";
-            reviewedBadge.textContent = "Reviewed";
+            reviewedBadge.textContent = "Saved";
             controls.appendChild(reviewedBadge);
+          } else if (queueItem.extracted) {
+            const extractedBadge = document.createElement("span");
+            extractedBadge.className = "badge teal";
+            extractedBadge.textContent = "Extracted";
+            controls.appendChild(extractedBadge);
+          } else if (queueItem.failed) {
+            const failedBadge = document.createElement("span");
+            failedBadge.className = "badge amber";
+            failedBadge.textContent = "Manual Review";
+            controls.appendChild(failedBadge);
           }
 
-          if (payload.activeDocument !== documentPath) {
+          if (!queueItem.active) {
             const button = document.createElement("button");
             button.className = "secondary";
-            button.textContent = "Select";
+            button.textContent = "Open";
+            button.disabled = batchRunning;
             button.addEventListener("click", async () => {
               statusEl.textContent = `Selecting ${documentPath}...`;
               const nextPayload = await requestJson("/api/select-document", {
@@ -1488,7 +1946,28 @@ def _build_html() -> str:
         }
       }
 
+      function renderBatchProgress(payload) {
+        const batch = payload.batchExtraction || {};
+        const total = batch.total || 0;
+        const completed = batch.completed || 0;
+        const showProgress = Boolean(batch.running || total > 0 || batch.summaryText);
+        batchProgressEl.classList.toggle("hidden", !showProgress);
+
+        if (!showProgress) {
+          return;
+        }
+
+        const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+        batchProgressTitleEl.textContent = batch.running
+          ? "Extracting selected documents"
+          : "Last batch extraction";
+        batchProgressCountEl.textContent = `${completed}/${total}`;
+        batchProgressFillEl.style.width = `${percent}%`;
+        batchProgressDetailEl.textContent = batch.summaryText || "No batch extraction has run yet.";
+      }
+
       function renderCategories(payload) {
+        const batchRunning = Boolean(payload.batchExtraction && payload.batchExtraction.running);
         categoriesErrorEl.textContent = payload.reviewCategoriesError
           ? `Categories unavailable: ${payload.reviewCategoriesError}`
           : "";
@@ -1535,6 +2014,7 @@ def _build_html() -> str:
               select.appendChild(option);
             }
 
+            select.disabled = batchRunning;
             select.addEventListener("change", async (event) => {
               const nextPayload = await requestJson("/api/update-category", {
                 method: "POST",
@@ -1551,6 +2031,7 @@ def _build_html() -> str:
             const checkbox = document.createElement("input");
             checkbox.type = "checkbox";
             checkbox.checked = Boolean(category.value);
+            checkbox.disabled = batchRunning;
             checkbox.addEventListener("change", async (event) => {
               const nextPayload = await requestJson("/api/update-category", {
                 method: "POST",
@@ -1570,6 +2051,7 @@ def _build_html() -> str:
       }
 
       function renderFields(payload) {
+        const batchRunning = Boolean(payload.batchExtraction && payload.batchExtraction.running);
         fieldsErrorEl.textContent = payload.reviewSchemaError
           ? `Fields unavailable: ${payload.reviewSchemaError}`
           : "";
@@ -1606,6 +2088,7 @@ def _build_html() -> str:
             input.type = field.type === "url" ? "url" : "text";
           }
           input.value = field.value || "";
+          input.disabled = batchRunning;
           input.addEventListener("change", async (event) => {
             const nextPayload = await requestJson("/api/update-field", {
               method: "POST",
@@ -1631,13 +2114,18 @@ def _build_html() -> str:
         schemaCountEl.textContent = String(payload.schemaCount);
         categoriesFileEl.textContent = payload.categoriesFile || "Not found";
         labelsFileEl.textContent = payload.labelsFile || "Not found";
+        const batchRunning = Boolean(payload.batchExtraction && payload.batchExtraction.running);
         refreshFolderButton.disabled = !payload.selectedFolder;
         refreshSchemasButton.disabled = !payload.selectedFolder;
         openActiveSchemaButton.disabled = !payload.activeSchema;
         openActiveDocumentButton.disabled = !payload.activeDocument;
-        extractDocumentButton.disabled = !payload.activeDocument || !payload.activeSchema;
-        saveReviewButton.disabled = !payload.activeDocument;
+        extractDocumentButton.disabled = batchRunning || !payload.activeDocument || !payload.activeSchema || payload.reviewedDocuments.includes(payload.activeDocument);
+        extractSelectedDocumentsButton.disabled = batchRunning || !payload.activeSchema || payload.extractableDocumentCount === 0;
+        selectAllDocumentsButton.disabled = batchRunning || !payload.documentQueue.length;
+        clearDocumentSelectionButton.disabled = batchRunning || payload.selectedDocumentCount === 0;
+        saveReviewButton.disabled = batchRunning || !payload.activeDocument;
         navReviewButton.disabled = !payload.selectedFolder;
+        queueSummaryEl.textContent = `${payload.selectedDocumentCount} selected, ${payload.extractableDocumentCount} ready to extract, ${payload.reviewedDocuments.length} already saved.`;
         activeSchemaNameEl.textContent = payload.activeSchema || "No active schema selected";
         schemaPreviewEl.textContent = payload.schemaPreviewError
           ? `Preview unavailable: ${payload.schemaPreviewError}`
@@ -1648,9 +2136,11 @@ def _build_html() -> str:
 
         renderSchemaRows(payload);
         renderDocumentReviewRows(payload);
+        renderBatchProgress(payload);
         renderRows(warningListEl, payload.warnings, "No warnings");
         renderCategories(payload);
         renderFields(payload);
+        ensureBatchPolling(payload.batchExtraction);
       }
 
       async function loadState() {
@@ -1677,6 +2167,25 @@ def _build_html() -> str:
         statusEl.textContent = "Refreshing schema list...";
         const payload = await requestJson("/api/refresh", { method: "POST" });
         renderState(payload);
+      });
+
+      selectAllDocumentsButton.addEventListener("click", async () => {
+        statusEl.textContent = "Selecting all unsaved documents...";
+        const payload = await requestJson("/api/select-all-documents", { method: "POST" });
+        renderState(payload);
+      });
+
+      clearDocumentSelectionButton.addEventListener("click", async () => {
+        statusEl.textContent = "Clearing document selection...";
+        const payload = await requestJson("/api/clear-document-selection", { method: "POST" });
+        renderState(payload);
+      });
+
+      extractSelectedDocumentsButton.addEventListener("click", async () => {
+        statusEl.textContent = "Extracting selected documents...";
+        const payload = await requestJson("/api/extract-selected-documents", { method: "POST" });
+        renderState(payload);
+        ensureBatchPolling(payload.batchExtraction);
       });
 
       openActiveSchemaButton.addEventListener("click", async () => {
