@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import subprocess
 import threading
 import traceback
@@ -13,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from data_labeler.extraction import extract_document_fields
 from data_labeler.models import ScanResult
@@ -245,13 +246,10 @@ def _relative_path(path: Path | None, root_path: Path | None) -> str | None:
     except ValueError:
         return str(path)
 
-
 def _document_key(document_path: Path) -> str:
     """Builds a stable in-memory key for a document path."""
 
     return str(document_path)
-
-
 def _find_document_by_relative_path(state: AppState, document_relative_path: str) -> Path:
     """Finds a scanned document by its review-queue relative path."""
 
@@ -264,7 +262,6 @@ def _find_document_by_relative_path(state: AppState, document_relative_path: str
             return document_path
 
     raise ValueError(f"Document not found: {document_relative_path}")
-
 
 def _sync_document_state(state: AppState) -> None:
     """Removes stale in-memory data after scanning or refreshing a folder."""
@@ -336,6 +333,32 @@ def _batch_extract_payload(state: AppState) -> dict[str, Any]:
         "cancelRequested": state.batch_extract_cancel_requested,
         "status": state.batch_extract_status,
         "summaryText": summary_text,
+    }
+
+
+def _document_preview_payload(state: AppState) -> dict[str, Any]:
+    """Builds preview metadata for the active document."""
+
+    if state.active_document is None or state.scan_result is None:
+        return {
+            "previewUrl": None,
+            "previewKind": None,
+            "previewTitle": "No document selected.",
+        }
+
+    suffix = state.active_document.suffix.lower()
+    if suffix == ".pdf":
+        preview_kind = "pdf"
+    elif suffix in {".jpg", ".jpeg", ".png"}:
+        preview_kind = "image"
+    else:
+        preview_kind = "unsupported"
+
+    relative_path = _relative_path(state.active_document, state.scan_result.root_path)
+    return {
+        "previewUrl": f"/api/document-file?path={quote(relative_path or '')}",
+        "previewKind": preview_kind,
+        "previewTitle": state.active_document.name,
     }
 
 
@@ -453,6 +476,7 @@ def _build_review_payload(state: AppState) -> dict[str, Any]:
             _relative_path(Path(document_key), state.scan_result.root_path)
             for document_key in sorted(state.reviewed_documents)
         ] if state.scan_result else [],
+        **_document_preview_payload(state),
     }
 
 
@@ -1056,6 +1080,15 @@ class DataLabelerHandler(BaseHTTPRequestHandler):
             self._send_json(_serialize_state(self.app_state))
             return
 
+        if parsed.path == "/api/document-file":
+            params = parse_qs(parsed.query)
+            document_relative_path = params.get("path", [""])[0]
+            document_path = _find_document_by_relative_path(
+                self.app_state, document_relative_path
+            )
+            self._send_file(document_path)
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def do_POST(self) -> None:  # noqa: N802
@@ -1240,6 +1273,17 @@ class DataLabelerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _send_file(self, file_path: Path) -> None:
+        """Writes a document file response for in-app preview."""
+
+        payload = file_path.read_bytes()
+        content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
 
 def _build_html() -> str:
     """Builds the single-page Story 3 user interface.
@@ -1360,6 +1404,15 @@ def _build_html() -> str:
         display: grid;
         grid-template-columns: 360px 1fr;
         gap: 20px;
+      }
+      .review-shell {
+        display: grid;
+        grid-template-columns: minmax(360px, 0.95fr) minmax(420px, 1.05fr);
+        gap: 20px;
+        align-items: start;
+      }
+      .review-shell.preview-hidden {
+        grid-template-columns: 1fr;
       }
       .panel { padding: 20px; }
       .panel-header {
@@ -1519,6 +1572,44 @@ def _build_html() -> str:
         line-height: 1.5;
         white-space: pre-wrap;
       }
+      .document-preview-shell {
+        min-height: 740px;
+        background: #fff;
+      }
+      .review-shell.preview-hidden .document-preview-shell {
+        display: none;
+      }
+      .document-preview-body {
+        background: #f6f8fc;
+        min-height: 700px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 18px;
+        overflow: auto;
+      }
+      .document-preview-body img {
+        display: block;
+        max-width: 100%;
+        max-height: 664px;
+        width: auto;
+        height: auto;
+        object-fit: contain;
+        border-radius: 14px;
+        box-shadow: 0 8px 24px rgba(17, 37, 62, 0.08);
+      }
+      .document-preview-body iframe {
+        width: 100%;
+        height: 664px;
+        border: 0;
+        background: #fff;
+        border-radius: 14px;
+      }
+      .document-preview-empty {
+        padding: 28px;
+        text-align: center;
+        color: var(--muted);
+      }
       .workspace {
         display: none;
       }
@@ -1572,7 +1663,7 @@ def _build_html() -> str:
         gap: 12px;
       }
       @media (max-width: 1180px) {
-        .grid-setup, .grid-review, .summary-grid, .field-grid, .category-grid {
+        .grid-setup, .grid-review, .review-shell, .summary-grid, .field-grid, .category-grid {
           grid-template-columns: 1fr;
         }
       }
@@ -1708,32 +1799,43 @@ def _build_html() -> str:
           <div class="panel">
             <div class="panel-header">
               <h2>Review Workspace</h2>
-              <button id="open-active-document" class="secondary" disabled>Open in Viewer</button>
+              <div class="doc-controls" style="margin-top: 0;">
+                <button id="toggle-preview" class="secondary">Hide Preview</button>
+                <button id="open-active-document" class="secondary" disabled>Open in Viewer</button>
+              </div>
             </div>
             <p class="subtitle" id="active-document-label">
               No document selected.
             </p>
-
-            <div class="list-shell" style="margin-top: 20px;">
-              <div class="list-header categories-header">Categories</div>
-              <div style="padding: 16px; background: #fff;">
-                <p id="categories-error" class="subtitle" style="margin: 0;"></p>
-                <div id="category-grid" class="category-grid"></div>
+            <div id="review-shell" class="review-shell" style="margin-top: 20px;">
+              <div class="list-shell document-preview-shell">
+                <div class="list-header" id="preview-title">Document Preview</div>
+                <div id="document-preview-body" class="document-preview-body"></div>
               </div>
-            </div>
 
-            <div class="list-shell" style="margin-top: 20px;">
-              <div class="list-header fields-header">Fields</div>
-              <div style="padding: 16px; background: #fff;">
-                <p id="fields-error" class="subtitle" style="margin: 0;"></p>
-                <div id="field-grid" class="field-grid"></div>
+              <div>
+                <div class="list-shell">
+                  <div class="list-header categories-header">Categories</div>
+                  <div style="padding: 16px; background: #fff;">
+                    <p id="categories-error" class="subtitle" style="margin: 0;"></p>
+                    <div id="category-grid" class="category-grid"></div>
+                  </div>
+                </div>
+
+                <div class="list-shell" style="margin-top: 20px;">
+                  <div class="list-header fields-header">Fields</div>
+                  <div style="padding: 16px; background: #fff;">
+                    <p id="fields-error" class="subtitle" style="margin: 0;"></p>
+                    <div id="field-grid" class="field-grid"></div>
+                  </div>
+                </div>
+
+                <div class="placeholder-actions">
+                  <button class="secondary" disabled>Save Draft</button>
+                  <button id="extract-document" class="secondary">Extract</button>
+                  <button id="save-review">Save Review</button>
+                </div>
               </div>
-            </div>
-
-            <div class="placeholder-actions">
-              <button class="secondary" disabled>Save Draft</button>
-              <button id="extract-document" class="secondary">Extract</button>
-              <button id="save-review">Save Review</button>
             </div>
           </div>
         </div>
@@ -1741,7 +1843,7 @@ def _build_html() -> str:
     </main>
 
     <script>
-      const state = { activeView: "setup", batchPollTimer: null };
+      const state = { activeView: "setup", batchPollTimer: null, previewVisible: true, lastPreviewPayload: null };
 
       const setupView = document.querySelector("#workspace-setup");
       const reviewView = document.querySelector("#workspace-review");
@@ -1761,6 +1863,9 @@ def _build_html() -> str:
       const schemaPreviewEl = document.querySelector("#schema-preview");
       const documentReviewListEl = document.querySelector("#document-review-list");
       const activeDocumentLabelEl = document.querySelector("#active-document-label");
+      const reviewShellEl = document.querySelector("#review-shell");
+      const previewTitleEl = document.querySelector("#preview-title");
+      const previewBodyEl = document.querySelector("#document-preview-body");
       const queueSummaryEl = document.querySelector("#queue-summary");
       const batchProgressEl = document.querySelector("#batch-progress");
       const batchProgressTitleEl = document.querySelector("#batch-progress-title");
@@ -1772,6 +1877,7 @@ def _build_html() -> str:
       const categoriesErrorEl = document.querySelector("#categories-error");
       const fieldsErrorEl = document.querySelector("#fields-error");
       const openActiveDocumentButton = document.querySelector("#open-active-document");
+      const togglePreviewButton = document.querySelector("#toggle-preview");
       const extractDocumentButton = document.querySelector("#extract-document");
       const saveReviewButton = document.querySelector("#save-review");
       const selectAllDocumentsButton = document.querySelector("#select-all-documents");
@@ -1984,6 +2090,50 @@ def _build_html() -> str:
         }
       }
 
+      function renderPreview(payload) {
+        state.lastPreviewPayload = payload;
+        reviewShellEl.classList.toggle("preview-hidden", !state.previewVisible);
+        togglePreviewButton.textContent = state.previewVisible ? "Hide Preview" : "Show Preview";
+
+        if (!state.previewVisible) {
+          previewTitleEl.textContent = payload.previewTitle || "Document Preview";
+          previewBodyEl.innerHTML = "";
+          return;
+        }
+
+        previewTitleEl.textContent = payload.previewTitle || "Document Preview";
+        previewBodyEl.innerHTML = "";
+
+        if (!payload.previewUrl || !payload.previewKind) {
+          const empty = document.createElement("div");
+          empty.className = "document-preview-empty";
+          empty.textContent = "Select a document to preview it side by side with the extracted content.";
+          previewBodyEl.appendChild(empty);
+          return;
+        }
+
+        if (payload.previewKind === "image") {
+          const image = document.createElement("img");
+          image.src = payload.previewUrl;
+          image.alt = payload.previewTitle || "Selected document";
+          previewBodyEl.appendChild(image);
+          return;
+        }
+
+        if (payload.previewKind === "pdf") {
+          const frame = document.createElement("iframe");
+          frame.src = payload.previewUrl;
+          frame.title = payload.previewTitle || "Selected document";
+          previewBodyEl.appendChild(frame);
+          return;
+        }
+
+        const unsupported = document.createElement("div");
+        unsupported.className = "document-preview-empty";
+        unsupported.textContent = "This file type cannot be previewed inline.";
+        previewBodyEl.appendChild(unsupported);
+      }
+
       function renderBatchProgress(payload) {
         const batch = payload.batchExtraction || {};
         const total = batch.total || 0;
@@ -2175,7 +2325,9 @@ def _build_html() -> str:
 
         renderSchemaRows(payload);
         renderDocumentReviewRows(payload);
+        renderPreview(payload);
         renderBatchProgress(payload);
+        renderPreview(payload);
         renderRows(warningListEl, payload.warnings, "No warnings");
         renderCategories(payload);
         renderFields(payload);
@@ -2256,6 +2408,11 @@ def _build_html() -> str:
         statusEl.textContent = "Opening active document...";
         const payload = await requestJson("/api/open-active-document", { method: "POST" });
         renderState(payload);
+      });
+
+      togglePreviewButton.addEventListener("click", () => {
+        state.previewVisible = !state.previewVisible;
+        renderPreview(state.lastPreviewPayload || {});
       });
 
       loadState();
