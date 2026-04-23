@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import mimetypes
 import subprocess
@@ -692,6 +694,94 @@ def _build_labels_records(state: AppState) -> list[dict[str, Any]]:
     return records
 
 
+def _csv_value(value: Any) -> str:
+    """Normalizes a value for CSV export."""
+
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _build_export_csv(state: AppState) -> tuple[str, str]:
+    """Builds a one-row-per-document CSV export for reviewed ground truth."""
+
+    if state.scan_result is None:
+        raise RuntimeError("Choose a folder before exporting CSV.")
+
+    records = _build_labels_records(state)
+    if not records:
+        raise RuntimeError("Save at least one reviewed document before exporting CSV.")
+
+    schema_fields, _ = _load_schema_definition(state.active_schema)
+    categories_path = state.scan_result.categories_file if state.scan_result else None
+    category_definitions, _ = _load_categories_definition(categories_path)
+
+    field_columns = [field["name"] for field in schema_fields if field.get("name")]
+    category_columns = [
+        f"category_{category['name']}"
+        for category in category_definitions
+        if category.get("name")
+    ]
+
+    extra_field_columns = sorted(
+        {
+            field_name
+            for record in records
+            for field_name in record.get("fields", {})
+            if field_name not in field_columns
+        }
+    )
+    extra_category_columns = sorted(
+        {
+            f"category_{category_name}"
+            for record in records
+            for category_name in record.get("categories", {})
+            if f"category_{category_name}" not in category_columns
+        }
+    )
+
+    headers = [
+        "document_id",
+        "file_name",
+        "file_path",
+        "schema_file",
+        "schema_path",
+        "status",
+        *field_columns,
+        *extra_field_columns,
+        *category_columns,
+        *extra_category_columns,
+    ]
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=headers, extrasaction="ignore")
+    writer.writeheader()
+
+    for record in records:
+        row = {
+            "document_id": _csv_value(record.get("document_id")),
+            "file_name": _csv_value(record.get("file_name")),
+            "file_path": _csv_value(record.get("file_path")),
+            "schema_file": _csv_value(record.get("schema_file")),
+            "schema_path": _csv_value(record.get("schema_path")),
+            "status": _csv_value(record.get("status")),
+        }
+
+        for field_name, value in record.get("fields", {}).items():
+            row[field_name] = _csv_value(value)
+
+        for category_name, value in record.get("categories", {}).items():
+            row[f"category_{category_name}"] = _csv_value(value)
+
+        writer.writerow(row)
+
+    folder_name = state.scan_result.root_path.name.replace(" ", "_") or "documents"
+    file_name = f"{folder_name}_ground_truth.csv"
+    return output.getvalue(), file_name
+
+
 def _save_active_review(state: AppState) -> None:
     """Persists the active document review into labels.json.
 
@@ -1072,12 +1162,24 @@ class DataLabelerHandler(BaseHTTPRequestHandler):
         """Handles GET requests for the UI and current state."""
 
         parsed = urlparse(self.path)
-        if parsed.path == "/":
-            self._send_html(_build_html())
-            return
+        try:
+            if parsed.path == "/":
+                self._send_html(_build_html())
+                return
 
-        if parsed.path == "/api/state":
-            self._send_json(_serialize_state(self.app_state))
+            if parsed.path == "/api/state":
+                self._send_json(_serialize_state(self.app_state))
+                return
+
+            if parsed.path == "/api/export-csv":
+                csv_content, download_name = _build_export_csv(self.app_state)
+                self._send_csv(csv_content, download_name)
+                return
+
+        except Exception as error:  # noqa: BLE001
+            traceback.print_exc()
+            self.app_state.status_message = f"Error: {error}"
+            self.send_error(HTTPStatus.BAD_REQUEST, str(error))
             return
 
         if parsed.path == "/api/document-file":
@@ -1273,6 +1375,16 @@ class DataLabelerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _send_csv(self, content: str, download_name: str) -> None:
+        """Writes a downloadable CSV response."""
+
+        payload = content.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{download_name}"',
+        )
     def _send_file(self, file_path: Path) -> None:
         """Writes a document file response for in-app preview."""
 
@@ -1837,6 +1949,12 @@ def _build_html() -> str:
                 </div>
               </div>
             </div>
+            <div class="placeholder-actions">
+              <button class="secondary" disabled>Save Draft</button>
+              <button id="extract-document" class="secondary">Extract</button>
+              <button id="save-review">Save Review</button>
+              <button id="export-csv" class="secondary">Download CSV</button>
+            </div>
           </div>
         </div>
       </section>
@@ -1880,6 +1998,7 @@ def _build_html() -> str:
       const togglePreviewButton = document.querySelector("#toggle-preview");
       const extractDocumentButton = document.querySelector("#extract-document");
       const saveReviewButton = document.querySelector("#save-review");
+      const exportCsvButton = document.querySelector("#export-csv");
       const selectAllDocumentsButton = document.querySelector("#select-all-documents");
       const clearDocumentSelectionButton = document.querySelector("#clear-document-selection");
       const extractSelectedDocumentsButton = document.querySelector("#extract-selected-documents");
@@ -2313,6 +2432,7 @@ def _build_html() -> str:
         selectAllDocumentsButton.disabled = batchRunning || !payload.documentQueue.length;
         clearDocumentSelectionButton.disabled = batchRunning || payload.selectedDocumentCount === 0;
         saveReviewButton.disabled = batchRunning || !payload.activeDocument;
+        exportCsvButton.disabled = payload.reviewedDocuments.length === 0;
         navReviewButton.disabled = !payload.selectedFolder;
         queueSummaryEl.textContent = `${payload.selectedDocumentCount} selected, ${payload.extractableDocumentCount} ready to extract, ${payload.reviewedDocuments.length} already saved.`;
         activeSchemaNameEl.textContent = payload.activeSchema || "No active schema selected";
@@ -2402,6 +2522,11 @@ def _build_html() -> str:
         statusEl.textContent = "Extracting fields...";
         const payload = await requestJson("/api/extract-document", { method: "POST" });
         renderState(payload);
+      });
+
+      exportCsvButton.addEventListener("click", () => {
+        statusEl.textContent = "Preparing CSV download...";
+        window.location.href = "/api/export-csv";
       });
 
       openActiveDocumentButton.addEventListener("click", async () => {
