@@ -90,24 +90,15 @@ def _extract_with_stub(
     document_path: Path,
     fields: list[dict[str, Any]],
 ) -> ExtractionResult:
-    """Builds placeholder extraction values for local demos."""
+    """Builds blank extraction values for local demos and fallback mode."""
 
     values: dict[str, str] = {}
-    document_hint = document_path.stem.replace("_", " ").replace("-", " ").strip()
     for field in fields:
         field_name = str(field.get("name", "")).strip()
         if not field_name:
             continue
 
-        label = str(field.get("label") or field_name)
-        field_type = str(field.get("type", "string")).lower()
-        if field_type in {"number", "boolean", "date"}:
-            values[field_name] = ""
-            continue
-
-        values[field_name] = (
-            f"Stub guess for {label} from {document_hint or document_path.name}"
-        )
+        values[field_name] = ""
 
     return ExtractionResult(
         field_values=values,
