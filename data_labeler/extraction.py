@@ -294,7 +294,16 @@ def _build_extraction_prompt(fields: list[dict[str, Any]]) -> str:
     return (
         "Extract values for the following schema fields from the attached document.\n"
         "Return only one JSON object that matches the provided schema.\n"
-        "Use empty strings when a value is not present or is not clear.\n"
+        "Prefer a best-effort extraction when the document shows a likely value.\n"
+        "Use empty strings only when a value is truly absent from the document.\n"
+        "When the schema includes firstname, middlename, and lastname, split a full "
+        "person name across those fields whenever the card makes that possible. Do "
+        "not put the entire name into only one of those fields unless the others are "
+        "truly unclear.\n"
+        "If a full person name is visible, infer the most likely first, middle, and "
+        "last name split from the printed text.\n"
+        "For phone and email, copy the exact visible contact value from the card "
+        "without adding commentary.\n"
         f"{joined_fields}"
     )
 

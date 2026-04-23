@@ -541,7 +541,11 @@ def _scan_selected_folder(state: AppState, folder: Path) -> None:
 
     state.selected_folder = folder
     state.scan_result = scan_folder(folder)
-    _sync_document_state(state)
+    state.review_data.clear()
+    state.selected_documents.clear()
+    state.extracted_documents.clear()
+    state.failed_documents.clear()
+    state.reviewed_documents.clear()
     _reset_batch_extract_progress(state)
 
     available_schemas = set(state.scan_result.schema_files)
@@ -549,7 +553,6 @@ def _scan_selected_folder(state: AppState, folder: Path) -> None:
         state.active_schema = get_default_active_schema(state.scan_result.schema_files)
 
     _ensure_active_document(state)
-    _load_saved_reviews(state)
     _ensure_review_record(state, state.active_document)
 
     document_count = state.scan_result.document_count
@@ -559,7 +562,8 @@ def _scan_selected_folder(state: AppState, folder: Path) -> None:
         )
     else:
         state.status_message = (
-            f"Scan complete. Found {document_count} supported documents."
+            f"Scan complete. Found {document_count} supported documents. "
+            "Started a fresh review session for this folder."
         )
 
 
