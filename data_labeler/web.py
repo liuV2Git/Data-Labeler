@@ -851,8 +851,6 @@ def _extract_active_document(state: AppState) -> None:
 
     _ensure_review_record(state, state.active_document)
     active_key = _document_key(state.active_document)
-    if active_key in state.reviewed_documents:
-        raise RuntimeError("This document is already saved in labels.json.")
 
     result = extract_document_fields(state.active_document, state.active_schema)
 
@@ -1942,11 +1940,6 @@ def _build_html() -> str:
                   </div>
                 </div>
 
-                <div class="placeholder-actions">
-                  <button class="secondary" disabled>Save Draft</button>
-                  <button id="extract-document" class="secondary">Extract</button>
-                  <button id="save-review">Save Review</button>
-                </div>
               </div>
             </div>
             <div class="placeholder-actions">
@@ -2426,7 +2419,7 @@ def _build_html() -> str:
         refreshSchemasButton.disabled = !payload.selectedFolder;
         openActiveSchemaButton.disabled = !payload.activeSchema;
         openActiveDocumentButton.disabled = !payload.activeDocument;
-        extractDocumentButton.disabled = batchRunning || !payload.activeDocument || !payload.activeSchema || payload.reviewedDocuments.includes(payload.activeDocument);
+        extractDocumentButton.disabled = batchRunning || !payload.activeDocument || !payload.activeSchema;
         extractSelectedDocumentsButton.disabled = batchRunning || !payload.activeSchema || payload.extractableDocumentCount === 0;
         cancelExtractSelectedDocumentsButton.disabled = !batchRunning || Boolean(payload.batchExtraction && payload.batchExtraction.cancelRequested);
         selectAllDocumentsButton.disabled = batchRunning || !payload.documentQueue.length;
